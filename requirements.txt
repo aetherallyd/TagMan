@@ -1,0 +1,5 @@
+mutagen
+Pillow
+yt-dlp
+ytmusicapi
+syncedlyrics
