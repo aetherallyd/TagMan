@@ -103,8 +103,8 @@ except Exception:
     CONFIG_PATH = Path.cwd() / ".tagman_config.json"
 
 DEFAULT_CONFIG = {
-    "remember_format":  None,        # None (always ask) / "m4a" / "mp3" / "flac"
-    "remember_quality": None,        # None (always ask) / "best" (128kbps default) / "160" / "192" / "256" (not used for flac)
+    "remember_format":  None,        # None (always ask) / "m4a" / "mp3" / "flac" / "opus"
+    "remember_quality": None,        # None (always ask) / "best" (128kbps default) / "160" / "192" / "256" / "320" / "968" (not used for flac)
     "preview_threshold": 7,          # how many thumbnails to preview before skipping the rest
     "rename_mode": "ask",            # "ask" (always prompt) / "auto" (do silently) / "off" (do nothing)
     "video_search_mode": "ask",      # "ask" (prompt each search) / "always" (always search videos too) / "never" (songs-only, old behavior)
@@ -3884,9 +3884,30 @@ def _fmt_quality_flags(fmt, quality):
     FLAC is lossless -- there's no target bitrate to sort by, so it always
     just grabs the best available source audio and converts it as-is.
     "quality" is ignored for flac (kept in the signature only so callers
-    don't need a special case)."""
+    don't need a special case).
+
+    320/968 kbps are universal -- available for every non-flac format, not
+    just opus. They force itag 251 (YouTube's own opus-audio stream) as the
+    source and use --audio-quality to actually re-encode at that target
+    bitrate, since a plain -S abr:X (used for 160/192/256 below) only steers
+    stream *selection* and won't reliably get you there. Whether the result
+    actually reaches that bitrate still depends on what data yt-dlp can pull
+    for that particular video -- if it can't, tell the user to drop back to
+    a lower Quality setting. (Reference: ytdlnis' equivalent yt-dlp
+    invocation.)
+
+    Opus's own "best" quality just keeps whatever native opus stream
+    YouTube already serves (no forced re-encode) -- normal, no different
+    from any other format's Default."""
     if fmt == "flac":
         return ["-f", "ba/b", "-x", "--audio-format", "flac"]
+    if quality in ("320", "968"):
+        return ["-f", "251/ba/b", "-x", "--audio-format", fmt, "-S", "aext:opus",
+                 "--audio-quality", f"{quality}k"]
+    if fmt == "opus":
+        # "best" (native passthrough) is the only tier left for opus here --
+        # 320/968 are handled by the shared branch above.
+        return ["-f", "ba/b", "-x", "--audio-format", "opus", "-S", "aext:opus"]
     if fmt == "m4a":
         if quality == "best":
             return ["-f", "ba/b", "-x", "--audio-format", "m4a", "-S", "aext:m4a"]
@@ -4073,6 +4094,7 @@ def _dl_run(url, fmt, quality, idx=None, total=None, artists_override=None):
             "members-only": "Members-only video.",
             "Sign in": "Video requires login (age-restricted or private).",
             "copyright": "Video blocked due to copyright in your region.",
+            "Requested format is not available": "This video doesn't have the source data for the selected Quality — try a lower Quality setting.",
             "not available": "Video not available in your region.",
         }
         hint = next((v for k, v in hints.items() if k.lower() in reason.lower()), None)
@@ -4238,7 +4260,8 @@ def _get_fmt_quality():
         _sub_box("Format", [
             (1, "M4A",  "AAC, more compatible"),
             (2, "MP3",  "universal"),
-            (3, "FLAC", "lossless, but not guarantee (experimental)"),
+            (3, "FLAC", "lossless, but not guarantee"),
+            (4, "Opus", "efficient, small files"),
             (0, "Back", None),
         ], width=50, icon="♪")
         try:
@@ -4247,10 +4270,10 @@ def _get_fmt_quality():
             return None, None
         if fc == 0:
             return None, None
-        if fc not in (1, 2, 3):
+        if fc not in (1, 2, 3, 4):
             print(f"  {Y}[!]{R} Invalid choice.")
             return None, None
-        fmt = {1: "m4a", 2: "mp3", 3: "flac"}[fc]
+        fmt = {1: "m4a", 2: "mp3", 3: "flac", 4: "opus"}[fc]
 
     if fmt == "flac":
         # FLAC is lossless -- there's no bitrate to pick, so skip the prompt
@@ -4262,7 +4285,9 @@ def _get_fmt_quality():
             (1, "Default",                 "best by default (128kbps)"),
             (2, "160 kbps",                 "target bitrate 160kbps"),
             (3, "192 kbps",                 "target bitrate 192kbps"),
-            (4, "256 kbps (experimental)",  "target bitrate 256kbps"),
+            (4, "256 kbps",                 "target bitrate 256kbps"),
+            (5, "320 kbps",                 "target bitrate 320kbps"),
+            (6, "968 kbps (experimental)",  "target bitrate 968kbps"),
             (0, "Back",                     None),
         ], width=54, icon="♪")
         try:
@@ -4271,10 +4296,10 @@ def _get_fmt_quality():
             return None, None
         if qc == 0:
             return None, None
-        if qc not in (1, 2, 3, 4):
+        if qc not in (1, 2, 3, 4, 5, 6):
             print(f"  {Y}[!]{R} Invalid choice.")
             return None, None
-        quality = {1: "best", 2: "160", 3: "192", 4: "256"}[qc]
+        quality = {1: "best", 2: "160", 3: "192", 4: "256", 5: "320", 6: "968"}[qc]
 
     return fmt, quality
 
@@ -4285,14 +4310,15 @@ def _settings_pick_remember_format():
         (1, "M4A",                       "AAC, more compatible"),
         (2, "MP3",                       "universal"),
         (3, "FLAC",                      "lossless, much bigger files"),
-        (4, "Don't remember",            "always ask on each download"),
+        (4, "Opus",                      "efficient, small files"),
+        (5, "Don't remember",            "always ask on each download"),
         (0, "Back",                      None),
     ], width=54, icon="⚙")
     try:
         c = int(_ask(f"\n{V}  ❯{R} Pick: "))
     except ValueError:
         return
-    mapping = {1: "m4a", 2: "mp3", 3: "flac", 4: None}
+    mapping = {1: "m4a", 2: "mp3", 3: "flac", 4: "opus", 5: None}
     if c not in mapping:
         return
     CONFIG["remember_format"] = mapping[c]
@@ -4304,15 +4330,17 @@ def _settings_pick_remember_quality():
         (1, "Default (128kbps)",       None),
         (2, "160 kbps",                None),
         (3, "192 kbps",                None),
-        (4, "256 kbps (experimental)", None),
-        (5, "Don't remember",          "always ask on each download"),
+        (4, "256 kbps",                None),
+        (5, "320 kbps",                None),
+        (6, "968 kbps (experimental)", None),
+        (7, "Don't remember",          "always ask on each download"),
         (0, "Back",                    None),
     ], width=54, icon="⚙")
     try:
         c = int(_ask(f"\n{V}  ❯{R} Pick: "))
     except ValueError:
         return
-    mapping = {1: "best", 2: "160", 3: "192", 4: "256", 5: None}
+    mapping = {1: "best", 2: "160", 3: "192", 4: "256", 5: "320", 6: "968", 7: None}
     if c not in mapping:
         return
     CONFIG["remember_quality"] = mapping[c]
@@ -4881,7 +4909,8 @@ def settings_menu():
         fmt_label = fmt_val.upper() if fmt_val else "Not set (always ask)"
         q_val     = CONFIG.get("remember_quality")
         q_label   = {"best": "Default (128kbps)", "160": "160 kbps", "192": "192 kbps",
-                     "256": "256 kbps (experimental)"}.get(q_val, "Not set (always ask)")
+                     "256": "256 kbps", "320": "320 kbps",
+                     "968": "968 kbps (experimental)"}.get(q_val, "Not set (always ask)")
         thresh    = CONFIG.get("preview_threshold", 7)
         rename    = CONFIG.get("rename_mode", "ask")
         vid_mode  = CONFIG.get("video_search_mode", "ask")
