@@ -141,6 +141,73 @@ def _save_config(cfg):
 
 CONFIG = _load_config()
 
+# ─── History Log ────────────────────────────────────────────────────────────
+# A running log of what TagMan has done in each folder -- tag edits, lyrics
+# embeds, cover embeds, and downloads (with the source URL) -- each entry
+# stamped with a local day-month-year date, a HH:MM:SS time, and which
+# folder it happened in. Stored centrally next to tagman.py (same place as
+# the config, for the same symlink/launcher reason -- see CONFIG_PATH above)
+# so Settings -> History can be opened from anywhere, but every read filters
+# down to just the entries whose "folder" matches the CURRENT working
+# directory, so one folder's history never bleeds into another's.
+try:
+    HISTORY_PATH = Path(__file__).resolve().parent / ".tagman_history.json"
+except Exception:
+    HISTORY_PATH = Path.cwd() / ".tagman_history.json"
+
+_HISTORY_MAX_ENTRIES = 1000  # oldest entries (across all folders) drop off past this
+
+def _history_load_all():
+    if not HISTORY_PATH.exists():
+        return []
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _history_save_all(entries):
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+def _history_log(entry_type, action, file=None, url=None):
+    """Append one history entry, scoped to the current folder. Never raises
+    -- a logging failure should never break the edit/download it's trying
+    to record."""
+    try:
+        now = time.localtime()
+        entry = {
+            "type": entry_type,      # "edit" / "lyrics" / "cover" / "download"
+            "action": action,        # short human-readable description
+            "file": file,
+            "url": url,
+            "folder": str(Path.cwd().resolve()),
+            "date": time.strftime("%d-%m-%Y", now),  # local day-month-year
+            "time": time.strftime("%H:%M:%S", now),
+            "timestamp": time.strftime("%d-%m-%Y %H:%M:%S", now),
+        }
+        entries = _history_load_all()
+        entries.append(entry)
+        if len(entries) > _HISTORY_MAX_ENTRIES:
+            entries = entries[-_HISTORY_MAX_ENTRIES:]
+        _history_save_all(entries)
+    except Exception:
+        pass
+
+def _history_for_this_folder():
+    """Every logged entry whose 'folder' matches cwd, oldest-first as
+    stored (callers decide display order)."""
+    try:
+        here = str(Path.cwd().resolve())
+    except Exception:
+        here = str(Path.cwd())
+    return [e for e in _history_load_all() if e.get("folder") == here]
+
 # ─── ANSI colors ──────────────────────────────────────────────────────────────
 R  = "\033[0m"         # reset
 V  = "\033[38;5;135m"  # violet (dominant)
@@ -531,6 +598,31 @@ def _fit_name(name, maxlen=48):
     breaking alignment on narrower phone terminals)."""
     return name if len(name) <= maxlen else name[:maxlen - 1].rstrip() + "…"
 
+def _sorted_song_picks(audio_files):
+    """Pair each audio file with an 'Artist - Title' display label (falling
+    back to just the title, or the filename stem, when tags are missing),
+    and sort A-Z by that label. This is the single shared ordering/format
+    used by every song-picker list in TagMan (Fetch Thumbnail, Redownload,
+    Batch Lyrics manual pick, ...) so the numbering is always predictable
+    instead of following whatever order files happened to scan in."""
+    items = []
+    for afp in audio_files:
+        t, a = _get_tags(afp)
+        title = t or afp.stem
+        label = f"{a} - {title}" if a else title
+        items.append((afp, title, a, label))
+    items.sort(key=lambda x: x[3].lower())
+    return items
+
+def _song_pick_rows(items, maxlen=50):
+    """Build _box()-ready rows (plain, colored) from _sorted_song_picks()
+    output, numbered 1..N to match the sorted order."""
+    rows = []
+    for i, (afp, title, a, label) in enumerate(items, 1):
+        label_f = _fit_name(label, maxlen=maxlen)
+        rows.append((f"  {i:>2}. {label_f}", f"  {P}{i:>2}{R}. {LV}{label_f}{R}"))
+    return rows
+
 def pick_file(show_album=False):
     """Single file picker (used only where exactly one file is needed)."""
     files = scan_audio()
@@ -714,6 +806,7 @@ def _embed_cover(fp, cover_path):
         with open(cover_path, "rb") as f:
             audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=f.read()))
         audio.save()
+    _history_log("cover", "Cover art embedded", file=Path(fp).name)
 
 def _has_cover_art(fp):
     """True if fp already has an actual embedded cover image (APIC/covr).
@@ -1114,6 +1207,7 @@ def _set_tag_single(fp, tag_type, value):
             if tag_type == "artist":
                 audio["TPE2"] = TPE2(encoding=3, text=value)
         audio.save()
+    _history_log("edit", f"{tag_type.capitalize()} set to \"{value}\"", file=Path(fp).name)
 
 def _batch_set_simple(tag_type, label):
     """Simple batch editor for the newer fields (Composer/Genre/Year/Track/Disc/
@@ -2346,6 +2440,7 @@ def _embed_lyrics(fp, lyrics):
         tags.delall("USLT")
         tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
         tags.save(str(fp))
+    _history_log("lyrics", "Lyrics embedded/updated", file=Path(fp).name)
 
 _TN_MARKER_RE = re.compile(r"^\[00:00\.00\]\s*TN\s*$")
 
@@ -2512,17 +2607,9 @@ def add_lyrics(fp=None):
             return
 
         if sub_mode == 2:
-            labeled = []
-            for afp in files:
-                t, a = _get_tags(afp)
-                labeled.append((t or afp.stem, a, afp))
-            labeled.sort(key=lambda x: x[0].lower())
-            files = [x[2] for x in labeled]
-            rows = []
-            for i, (label, a, afp) in enumerate(labeled, 1):
-                label_f = _fit_name(label, maxlen=34)
-                a_f = _fit_name(a, maxlen=20) if a else a
-                rows.append((f"  {i:>2}. {label_f}  [{a_f or '—'}]", f"  {P}{i:>2}{R}. {LV}{label_f}{R}  {DIM}[{a_f or '—'}]{R}"))
+            items = _sorted_song_picks(files)
+            files = [it[0] for it in items]
+            rows = _song_pick_rows(items)
             rows.append((f"   0. Back", f"   {P}0{R}. {DIM}Back{R}"))
             _box("Pick File(s) (multi)", rows, min_width=50, icon="☰")
             raw = _ask(f"\n{V}  ❯{R} Number(s) (e.g., 1,4,5): ").strip()
@@ -3688,12 +3775,9 @@ def fetch_thumbnails_from_ytmusic():
         print(f"\n{Y}[!]{R} {_scan_empty_message('No audio files in this folder.')}")
         return
 
-    rows = []
-    for i, afp in enumerate(audio_files, 1):
-        t, a = _get_tags(afp)
-        label = _fit_name(t or afp.stem, maxlen=34)
-        a_f = _fit_name(a, maxlen=20) if a else a
-        rows.append((f"  {i:>2}. {label}  [{a_f or '—'}]", f"  {P}{i:>2}{R}. {LV}{label}{R}  {DIM}[{a_f or '—'}]{R}"))
+    items = _sorted_song_picks(audio_files)
+    audio_files = [it[0] for it in items]
+    rows = _song_pick_rows(items)
     _box("Song List", rows, min_width=50, icon="☰")
 
     blacklist_raw = _ask(f"\n  {C}Enter numbers of songs to skip (blacklist){R}, e.g., 1,4,5: ").strip()
@@ -3835,12 +3919,9 @@ def fetch_single_thumbnail_from_ytmusic():
         print(f"\n{Y}[!]{R} {_scan_empty_message('No audio files in this folder.')}")
         return
 
-    rows = []
-    for i, afp in enumerate(audio_files, 1):
-        t, a = _get_tags(afp)
-        label = _fit_name(t or afp.stem, maxlen=34)
-        a_f = _fit_name(a, maxlen=20) if a else a
-        rows.append((f"  {i:>2}. {label}  [{a_f or '—'}]", f"  {P}{i:>2}{R}. {LV}{label}{R}  {DIM}[{a_f or '—'}]{R}"))
+    items = _sorted_song_picks(audio_files)
+    audio_files = [it[0] for it in items]
+    rows = _song_pick_rows(items)
     rows.append((f"   0. Back", f"   {P}0{R}. {DIM}Back{R}"))
     _box("Pick Song", rows, min_width=50, icon="☰")
 
@@ -4454,7 +4535,7 @@ def _apply_ytmusic_artists(fp, artist_names):
     except Exception as e:
         print(f"  {Y}[!]{R} Couldn't apply YTMusic artist data: {e}")
 
-def _post_process_download(dl_fp, thumb_url=None, artists_override=None):
+def _post_process_download(dl_fp, thumb_url=None, artists_override=None, source_url=None, history_action="Downloaded"):
     """Shared post-download step: stamp the TagMan comment, patch blank
     copyright/composer/genre with the 'TN' fallback, and manually embed
     cover art if yt-dlp's own --embed-thumbnail step silently failed (known
@@ -4465,7 +4546,12 @@ def _post_process_download(dl_fp, thumb_url=None, artists_override=None):
     (see _apply_ytmusic_artists), used to correct whatever yt-dlp's own
     metadata-parsing heuristic wrote for ARTIST/ALBUM ARTIST. Only pass this
     when the download came from a YTMusic search result -- for raw URLs
-    there's no authoritative source to fall back on."""
+    there's no authoritative source to fall back on.
+
+    source_url/history_action: recorded in History (Settings -> History) so
+    downloads show up with their source link. history_action lets callers
+    like Redownload log a more specific action than the plain "Downloaded"
+    default."""
     if not dl_fp or not Path(dl_fp).exists():
         return
     _SESSION_DOWNLOADED_FILES.append(Path(dl_fp))
@@ -4505,6 +4591,7 @@ def _post_process_download(dl_fp, thumb_url=None, artists_override=None):
             print(f"  {DIM}[~] Cover art embedded manually for {Path(dl_fp).name} (yt-dlp's thumbnail step didn't take).{R}")
         else:
             print(f"  {Y}[!]{R} Couldn't embed cover art manually for {Path(dl_fp).name} either — check tags to confirm.")
+    _history_log("download", f"{history_action}: {Path(dl_fp).name}", file=Path(dl_fp).name, url=source_url)
 
 def _dl_run_playlist(url, fmt, quality):
     """Download every track in a playlist. Unlike _dl_run (one file, one
@@ -4529,7 +4616,7 @@ def _dl_run_playlist(url, fmt, quality):
     for i, dl_fp in enumerate(fps):
         thumb_url = thumbs[i] if i < len(thumbs) else None
         if dl_fp and Path(dl_fp).exists():
-            _post_process_download(dl_fp, thumb_url)
+            _post_process_download(dl_fp, thumb_url, source_url=url, history_action="Downloaded (playlist)")
             ok += 1
 
     if result.returncode != 0:
@@ -4540,7 +4627,7 @@ def _dl_run_playlist(url, fmt, quality):
 _RETRYABLE_ERRORS = ("403", "429", "500", "502", "503", "timed out", "connection reset")
 _MAX_DL_RETRIES = 5
 
-def _dl_run(url, fmt, quality, idx=None, total=None, artists_override=None):
+def _dl_run(url, fmt, quality, idx=None, total=None, artists_override=None, history_action="Downloaded"):
     prefix = f"[{idx}/{total}] " if idx else ""
     print(f"  {prefix}{url[:65]}")
     cmd = _build_yt_cmd(url, fmt, quality)
@@ -4558,7 +4645,7 @@ def _dl_run(url, fmt, quality, idx=None, total=None, artists_override=None):
                                 if l.startswith("TAGMAN_THUMBNAIL::")), None)
             dl_fp     = fp_line.split("TAGMAN_FILEPATH::", 1)[1].strip() if fp_line else None
             thumb_url = thumb_line.split("TAGMAN_THUMBNAIL::", 1)[1].strip() if thumb_line else None
-            _post_process_download(dl_fp, thumb_url, artists_override=artists_override)
+            _post_process_download(dl_fp, thumb_url, artists_override=artists_override, source_url=url, history_action=history_action)
             print(f"  {G}[+]{R} Done!\n")
             return True
 
@@ -4597,6 +4684,238 @@ def _random_filename(prefix="bd", ext="txt"):
     suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
     return f"{prefix}_{suffix}.{ext}"
 
+# ─── Redownload (Sorcerer) ──────────────────────────────────────────────────
+# Re-fetches songs already sitting in the folder: builds a search query from
+# each file's own tags (falling back to the filename when a tag is blank,
+# same fallback fetch_thumbnails_from_ytmusic() uses), auto-picks whichever
+# search result looks most like the original via fuzzy token overlap, asks
+# for a quick Y/n confirm, and only falls back to a manual top-10 pick list
+# if that best guess gets rejected.
+
+def _score_match(orig_title, orig_artist, result):
+    """0..1 similarity between a song's own tags and a YTMusic/yt-dlp search
+    result, using the same fuzzy token-overlap (Dice coefficient) approach
+    _match_img_to_audio() uses for cover-art matching."""
+    r_title = result.get("title", "") or ""
+    r_artist = ", ".join(a["name"] for a in result.get("artists", [])) or ""
+    orig_tokens = _tokenize(orig_title or "")
+    if orig_artist:
+        orig_tokens |= _tokenize(orig_artist)
+    res_tokens = _tokenize(r_title) | _tokenize(r_artist)
+    if not orig_tokens or not res_tokens:
+        return 0.0
+    s1 = _fuzzy_token_score(orig_tokens, res_tokens) / len(orig_tokens)
+    s2 = _fuzzy_token_score(res_tokens, orig_tokens) / len(res_tokens)
+    return (2 * s1 * s2 / (s1 + s2)) if (s1 + s2) > 0 else 0.0
+
+def _show_search_result(r, n=None):
+    r_title = r.get("title", "?")
+    r_artist = ", ".join(a["name"] for a in r.get("artists", [])) or "?"
+    vid = r.get("videoId", "")
+    url = f"https://music.youtube.com/watch?v={vid}" if vid else ""
+    if n is not None:
+        print(f"  {P}{n:2}{R}. {LV}{r_title[:45]}{R}")
+    else:
+        print(f"      {LV}{r_title[:45]}{R}")
+    print(f"      {DIM}{r_artist[:40]}  {url}{R}")
+
+def _redownload_one(afp, orig_title, orig_artist, query, fmt, quality, include_videos, idx=None, total=None):
+    """Redownload a single already-on-disk song: search using its own tags,
+    auto-pick the closest match, confirm, and fall back to a manual top-10
+    pick if the auto-pick is rejected. Returns True on a successful
+    download."""
+    hdr = f"[{idx}/{total}] {afp.name}" if idx else afp.name
+    hw = max(30, len(hdr) + 4)
+    print(f"\n{V}  ╔═ {hdr} {'═' * max(0, hw - len(hdr) - 3)}╗{R}")
+    print(f"{V}  ╚{'═' * hw}╝{R}")
+    print(f"  {DIM}Query: {query}{R}\n")
+
+    results = _search_songs(query, limit=15, include_videos=include_videos)
+    if not results:
+        print(f"  {Y}[!]{R} No results.")
+        return False
+
+    scored = sorted(results, key=lambda r: _score_match(orig_title, orig_artist, r), reverse=True)
+    best = scored[0]
+    best_score = _score_match(orig_title, orig_artist, best)
+
+    if not best.get("videoId"):
+        print(f"  {Y}[!]{R} Best match has no video ID.")
+        return False
+
+    print(f"  {LV}Best match{R} {DIM}(similarity {best_score:.0%}){R}:")
+    _show_search_result(best)
+
+    konfirm = input(f"\n  Use this match? (Y/n): ").strip().lower()
+    chosen = None
+    if konfirm != "n":
+        chosen = best
+    else:
+        top10 = scored[:10]
+        rows = []
+        for n, r in enumerate(top10, 1):
+            r_title = r.get("title", "?")
+            r_artist = ", ".join(a["name"] for a in r.get("artists", [])) or "?"
+            vid2 = r.get("videoId", "")
+            url2 = f"https://music.youtube.com/watch?v={vid2}" if vid2 else ""
+            rows.append((f"  {n:2}. {r_title[:45]}", f"  {P}{n:2}{R}. {LV}{r_title[:45]}{R}"))
+            rows.append((f"      {r_artist[:40]}  {url2}", f"      {DIM}{r_artist[:40]}  {url2}{R}"))
+        rows.append((f"   0. Skip this song", f"   {P}0{R}. {DIM}Skip this song{R}"))
+        _box("Alternate matches", rows, min_width=55, max_width=76, icon="✧")
+        try:
+            pick = int(_ask(f"\n{V}  ❯{R} Pick: "))
+        except ValueError:
+            pick = 0
+        if pick == 0 or not (1 <= pick <= len(top10)):
+            print(f"  {DIM}Skipped.{R}")
+            return False
+        chosen = top10[pick - 1]
+
+    vid = chosen.get("videoId", "")
+    if not vid:
+        print(f"  {Y}[!]{R} No video ID for that pick.")
+        return False
+    url = f"https://music.youtube.com/watch?v={vid}"
+    artists_override = ([a["name"] for a in chosen.get("artists", [])]
+                         if chosen.get("artist_source") == "ytmusic" else None)
+    ok = _dl_run(url, fmt, quality, idx=idx, total=total, artists_override=artists_override,
+                  history_action="Redownloaded")
+    if ok:
+        _carry_over_lyrics_and_cleanup(afp)
+    return ok
+
+def _carry_over_lyrics_and_cleanup(old_fp):
+    """After a successful Redownload, pull just the lyrics field from the
+    old file and embed it into the freshly downloaded replacement (the most
+    recent entry in _SESSION_DOWNLOADED_FILES -- Redownload runs strictly
+    one song at a time, so this is always the file that was just
+    downloaded), then delete the old file so the folder doesn't end up with
+    both the stale and the new copy sitting side by side."""
+    if not _SESSION_DOWNLOADED_FILES:
+        return
+    new_fp = _SESSION_DOWNLOADED_FILES[-1]
+    try:
+        if new_fp.resolve() == Path(old_fp).resolve():
+            return  # safety net: never actually the same file, but just in case
+    except Exception:
+        pass
+
+    try:
+        if _has_lyrics(old_fp):
+            lyrics = _get_lyrics(old_fp)
+            if lyrics:
+                _embed_lyrics(new_fp, lyrics)
+                print(f"  {DIM}[~] Lyrics carried over from {Path(old_fp).name}.{R}")
+    except Exception as e:
+        print(f"  {Y}[!]{R} Couldn't carry over lyrics: {e}")
+
+    try:
+        Path(old_fp).unlink()
+        print(f"  {DIM}[—] Old file deleted: {Path(old_fp).name}{R}")
+    except Exception as e:
+        print(f"  {Y}[!]{R} Couldn't delete old file {Path(old_fp).name}: {e}")
+
+def _redownload_menu():
+    """Sorcerer -> Redownload. Single (multi-pick) or Batch (everything)
+    over whatever scan_audio() finds (folder picker included, same as
+    every other Sorcerer/scan feature). Picks get stashed in a temp,
+    randomly-named JSON file for the duration of the run -- purely a
+    working file, deleted once the run finishes."""
+    audio_files = scan_audio()
+    if not audio_files:
+        print(f"\n{Y}[!]{R} {_scan_empty_message('No audio files in this folder.')}")
+        return
+
+    _sub_box("Redownload", [
+        (1, "Single", "pick song(s) to redownload"),
+        (2, "Batch",  "redownload every song in this folder"),
+        (0, "Back",   None),
+    ], width=52, icon="⟳")
+    try:
+        rm = int(_ask(f"\n{V}  ❯{R} Pick: "))
+    except ValueError:
+        return
+    if rm == 0:
+        return
+    if rm not in (1, 2):
+        print(f"  {Y}[!]{R} Invalid choice.")
+        return
+
+    if rm == 1:
+        items = _sorted_song_picks(audio_files)
+        rows = _song_pick_rows(items)
+        _box("Pick Song(s)", rows, min_width=50, icon="☰")
+        raw = _ask(f"\n  {C}Number(s) to redownload{R}, e.g., 1,3,5: ").strip()
+        picks = _parse_multi_input(raw, len(items))
+        if not picks:
+            print(f"  {DIM}Cancelled.{R}")
+            return
+        chosen_files = [items[p - 1][0] for p in picks]
+    else:
+        chosen_files = audio_files
+
+    tasks = []
+    for afp in chosen_files:
+        title, artist = _get_tags(afp)
+        orig_title = title or afp.stem  # fallback to filename when title tag is missing
+        query = f"{artist} - {orig_title}" if artist else orig_title
+        tasks.append((afp, orig_title, artist, query))
+
+    # Stash the picks in a temp random JSON file, purely as working state
+    # for this run -- cleaned up once the run finishes either way.
+    json_path = Path(_random_filename(prefix="rdl", ext="json"))
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [{"file": str(t[0]), "title": t[1], "artist": t[2], "query": t[3]} for t in tasks],
+                f, indent=2, ensure_ascii=False
+            )
+    except Exception:
+        json_path = None
+
+    fmt, quality = _get_fmt_quality()
+    if not fmt:
+        if json_path:
+            try: json_path.unlink()
+            except Exception: pass
+        return
+
+    print(f"\n{_ts()} {LV}[i]{R} {len(tasks)} song(s) to redownload | {_fmt_quality_label(fmt, quality)}")
+    if json_path:
+        print(f"  {DIM}[~] Selection saved temporarily to {json_path.name}{R}")
+
+    include_videos = _resolve_video_search_pref()
+    _get_session_destination()
+    _print_patience_banner()
+
+    good = fail = 0
+    failed_names = []
+    for i, (afp, orig_title, artist, query) in enumerate(tasks, 1):
+        ok = _redownload_one(afp, orig_title, artist, query, fmt, quality, include_videos, idx=i, total=len(tasks))
+        if ok:
+            good += 1
+        else:
+            fail += 1
+            failed_names.append(afp.name)
+
+    if json_path:
+        try:
+            json_path.unlink()
+            print(f"  {DIM}[—] {json_path.name} deleted.{R}")
+        except Exception:
+            pass
+
+    rows = [
+        (f"  Redownloaded   : {good}", f"  {G}Redownloaded   :{R} {good}"),
+        (f"  Skipped/failed : {fail}", f"  {Y}Skipped/failed :{R} {fail}"),
+    ]
+    if failed_names:
+        rows.append((f"  Skipped/failed files:", f"  {DIM}Skipped/failed files:{R}"))
+        for name in failed_names:
+            rows.append((f"    • {name}", f"    {DIM}• {name}{R}"))
+    _box("Summary", rows, min_width=50, icon="☰")
+    print(f"  {DIM}Finished {_ts()}{R}")
+
 def downloader():
     _SESSION_DOWNLOADED_FILES.clear()
     _maybe_reset_session_destination()
@@ -4604,6 +4923,7 @@ def downloader():
         (1, "Search & Download", "search songs, or paste link(s)"),
         (2, "Batch from .txt",   "download multiple URLs at once"),
         (3, "Download Playlist", "download an entire playlist from a URL"),
+        (4, "Redownload",        "refetch songs already here, using their tags"),
         (0, "Back",              None),
     ], width=50, icon="✧")
     try:
@@ -4681,6 +5001,9 @@ def downloader():
         _get_session_destination()
         _print_patience_banner()
         _dl_run_playlist(url, fmt, quality)
+        _refresh_media_scan()
+    elif mode == 4:
+        _redownload_menu()
         _refresh_media_scan()
     else:
         print(f"  {Y}[!]{R} Invalid choice.")
@@ -4945,8 +5268,14 @@ def _find_stray_json_files():
     """Scan the current working directory (non-recursive) for .json files --
     leftover metadata exports from Export/Import Metadata (*_meta.json) or
     any other stray .json left behind. Same non-recursive Path.cwd()
-    reasoning as the .txt/thumbnail scans above."""
-    return sorted(Path.cwd().glob("*.json"))
+    reasoning as the .txt/thumbnail scans above.
+
+    Excludes TagMan's own ".tagman_*.json" files (config, history) -- glob()
+    matches dotfiles too (unlike shell globbing), so without this exclusion
+    the Cleaner would offer to delete the config/history right alongside
+    genuine stray exports whenever tagman.py's own folder is the cwd being
+    cleaned."""
+    return sorted(f for f in Path.cwd().glob("*.json") if not f.name.startswith(".tagman_"))
 
 def _cleaner_do_delete(files, label):
     if not files:
@@ -5390,6 +5719,78 @@ def _create_folder_shortcut():
         print(f"  {Y}[!]{R} Failed to create shortcut: {e}")
 
 
+_HISTORY_TYPE_ICON = {"download": "⇣", "edit": "✎", "lyrics": "♪", "cover": "◆"}
+
+def _history_show(entries):
+    if not entries:
+        print(f"\n  {DIM}Nothing to show.{R}")
+        return
+    rows = []
+    for e in entries:
+        icon = _HISTORY_TYPE_ICON.get(e.get("type"), "•")
+        rows.append((
+            f"  {icon} [{e.get('timestamp', '?')}] {e.get('type', '?').upper()}",
+            f"  {icon} {DIM}[{e.get('timestamp', '?')}]{R} {LV}{e.get('type', '?').upper()}{R}"
+        ))
+        action = e.get("action", "")
+        rows.append((f"    {action}", f"    {action}"))
+        if e.get("file"):
+            rows.append((f"    File: {e['file']}", f"    {DIM}File: {e['file']}{R}"))
+        if e.get("url"):
+            rows.append((f"    URL: {e['url']}", f"    {DIM}URL: {e['url']}{R}"))
+    _box("History", rows, min_width=55, max_width=76, icon="⏱")
+
+def _history_menu():
+    """Settings -> History. Only ever shows entries logged from the CURRENT
+    folder (matched by absolute path) -- see _history_for_this_folder()."""
+    while True:
+        entries = list(reversed(_history_for_this_folder()))  # newest first
+        if not entries:
+            print(f"\n  {Y}[!]{R} No history recorded for this folder yet.")
+            print(f"  {DIM}{Path.cwd()}{R}")
+            return
+
+        _sub_box("History", [
+            (1, "View recent",              "last 25 entries for this folder"),
+            (2, "Filter by type",           "download / edit / lyrics / cover"),
+            (3, "Clear this folder's history", None),
+            (0, "Back",                     None),
+        ], width=55, icon="⏱")
+        try:
+            c = int(_ask(f"\n{V}  ❯{R} Pick: "))
+        except ValueError:
+            return
+        if c == 0:
+            return
+        elif c == 1:
+            _history_show(entries[:25])
+        elif c == 2:
+            types = sorted({e.get("type", "?") for e in entries})
+            rows = [(f"  {i}. {t}", f"  {P}{i}{R}. {LV}{t}{R}") for i, t in enumerate(types, 1)]
+            rows.append((f"   0. Back", f"   {P}0{R}. {DIM}Back{R}"))
+            _box("Pick Type", rows, min_width=40, icon="☰")
+            try:
+                tpick = int(_ask(f"\n{V}  ❯{R} Pick: "))
+            except ValueError:
+                continue
+            if tpick == 0 or not (1 <= tpick <= len(types)):
+                continue
+            wanted = types[tpick - 1]
+            _history_show([e for e in entries if e.get("type") == wanted][:50])
+        elif c == 3:
+            konfirm = input(f"\n  Delete ALL history entries for this folder? This can't be undone. (y/N): ").strip().lower()
+            if konfirm == "y":
+                all_entries = _history_load_all()
+                here = str(Path.cwd().resolve())
+                before = len(all_entries)
+                kept = [e for e in all_entries if e.get("folder") != here]
+                if _history_save_all(kept):
+                    print(f"  {G}[+]{R} Cleared {before - len(kept)} entr{'y' if before - len(kept) == 1 else 'ies'} for this folder.")
+                else:
+                    print(f"  {Y}[!]{R} Failed to save.")
+        else:
+            print(f"  {Y}[!]{R} Invalid choice.")
+
 def settings_menu():
     """Menu 8: view & edit TagMan config. Can also edit JSON file manually."""
     while True:
@@ -5414,6 +5815,7 @@ def settings_menu():
             (7, f"Video Search Mode: {vid_mode}",         "'ask', 'always', or 'never' search videos too"),
             (8, "Folder Shortcut",                        "browse (interactive) & drop a launcher shortcut into a folder"),
             (9, f"Folder Reset Mode: {fold_mode}",        "'always_ask' (return to $HOME after each task) or 'ignore' (stay put)"),
+            (10, "History",                               "view edit/download history for this folder"),
             (0, "Back",                                  None),
         ], width=60, icon="⚙")
 
@@ -5443,6 +5845,8 @@ def settings_menu():
             _create_folder_shortcut()
         elif c == 9:
             _settings_folder_reset_mode()
+        elif c == 10:
+            _history_menu()
         else:
             print(f"  {Y}[!]{R} Invalid choice.")
 
