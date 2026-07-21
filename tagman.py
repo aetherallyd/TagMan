@@ -6,6 +6,7 @@
 # optional: msedit (used by Lyrics Editor if installed, otherwise falls back to nano)
 
 import os
+import re
 import sys
 import shutil
 import threading
@@ -207,6 +208,16 @@ def _ask(prompt):
         if stripped == "":
             continue
         return raw
+
+def _ask_optional(prompt):
+    """Like _ask(), but for prompts where an empty Enter is a valid answer
+    (e.g. 'Enter to skip'). _ask() re-prompts forever on empty input, which
+    is right for menu/number prompts but wrong here -- this variant returns
+    "" immediately instead of looping. Still honors the main-menu shortcut."""
+    raw = input(prompt)
+    if raw.strip() == MAIN_MENU_CODE:
+        raise _ToMainMenu()
+    return raw
 
 def _vlen(s):
     """Visual length: Wide/Fullwidth characters count as 2 columns."""
@@ -1149,6 +1160,7 @@ def batch_set_tag(tag_type):
         _sub_box("Batch Change Artist", [
             (1, "Artist + Album Artist", "both"),
             (2, "Album Artist only",     None),
+            (3, "Artist only",           None),
             (0, "Back",                  None),
         ], width=48, icon="✎")
         try:
@@ -1157,11 +1169,12 @@ def batch_set_tag(tag_type):
             return
         if msub == 0:
             return
-        if msub not in (1, 2):
+        if msub not in (1, 2, 3):
             print(f"  {Y}[!]{R} Invalid choice.")
             return
-        artist_mode = "both" if msub == 1 else "aa_only"
-        label = "Artist + Album Artist" if artist_mode == "both" else "Album Artist"
+        artist_mode = {1: "both", 2: "aa_only", 3: "artist_only"}[msub]
+        label = {"both": "Artist + Album Artist", "aa_only": "Album Artist",
+                  "artist_only": "Artist"}[artist_mode]
 
     files = scan_audio()
     if not files:
@@ -1274,7 +1287,8 @@ def batch_set_tag(tag_type):
         except Exception as e:
             fail.append((afp.name, str(e)))
 
-    mode_label = "Artist + Album Artist" if artist_mode == "both" else "Album Artist"
+    mode_label = {"both": "Artist + Album Artist", "aa_only": "Album Artist",
+                  "artist_only": "Artist"}.get(artist_mode, "Artist")
     out_label  = mode_label if tag_type == "artist" else label
     print(f"\n  {G}[+]{R} {ok} file(s) updated → {out_label}: {new_value}")
     for name, err in fail:
@@ -1282,31 +1296,37 @@ def batch_set_tag(tag_type):
 
 
 def _set_artist_field(fp, value, mode):
-    """mode='both' (artist+album artist) or 'aa_only' (album artist only)."""
+    """mode='both' (artist+album artist), 'aa_only' (album artist only), or
+    'artist_only' (artist only, leaves Album Artist untouched)."""
     ext = Path(fp).suffix.lower()
     if ext == ".m4a":
         from mutagen.mp4 import MP4
         audio = MP4(str(fp))
-        if mode == "both":
+        if mode in ("both", "artist_only"):
             audio["\xa9ART"] = [value]
-        audio["aART"] = [value]
+        if mode in ("both", "aa_only"):
+            audio["aART"] = [value]
         audio.save()
     elif ext in (".flac", ".opus"):
         audio = _open_vorbis(fp, ext)
-        if mode == "both":
+        if mode in ("both", "artist_only"):
             audio["artist"] = [value]
-        audio["albumartist"] = [value]
+        if mode in ("both", "aa_only"):
+            audio["albumartist"] = [value]
         audio.save()
     else:
         from mutagen.id3 import ID3, TPE1, TPE2
         audio = ID3(str(fp))
-        if mode == "both":
+        if mode in ("both", "artist_only"):
             audio["TPE1"] = TPE1(encoding=3, text=value)
-        audio["TPE2"] = TPE2(encoding=3, text=value)
+        if mode in ("both", "aa_only"):
+            audio["TPE2"] = TPE2(encoding=3, text=value)
         audio.save()
     if mode == "both":
         print(f"  {G}[+]{R} Artist set to: {value}")
         print(f"  {DIM}[~] Album Artist also updated → {value}{R}")
+    elif mode == "artist_only":
+        print(f"  {G}[+]{R} Artist set to: {value}")
     else:
         print(f"  {G}[+]{R} Album Artist set to: {value}")
 
@@ -1317,6 +1337,7 @@ def set_tag(fp, tag_type):
             print(f"\n{V}  ╔═ Change Artist ════════════════════════════════╗{R}")
             print(f"{V}  ║{R}  {P}1{R}. {LV}Artist + Album Artist{R}   {DIM}(both){R}")
             print(f"{V}  ║{R}  {P}2{R}. {LV}Album Artist only{R}")
+            print(f"{V}  ║{R}  {P}3{R}. {LV}Artist only{R}")
             print(f"{V}  ║{R}  {P}0{R}. {DIM}Back{R}")
             print(f"{V}  ╚{'=' * 48}╝{R}")
             try:
@@ -1325,18 +1346,26 @@ def set_tag(fp, tag_type):
                 return
             if sub == 0:
                 return
-            if sub not in (1, 2):
+            if sub not in (1, 2, 3):
                 print(f"  {Y}[!]{R} Invalid choice.")
                 return
-            mode  = "both" if sub == 1 else "aa_only"
-            label = "Artist + Album Artist" if mode == "both" else "Album Artist"
+            mode  = {1: "both", 2: "aa_only", 3: "artist_only"}[sub]
+            label = {"both": "Artist + Album Artist", "aa_only": "Album Artist",
+                      "artist_only": "Artist"}[mode]
             value = input(f"\n  New {label}: ").strip()
             if not value:
                 print("Cancelled.")
                 return
+            _, current_artist = _get_tags(fp)
+            print(f"\n  {DIM}Now:{R} {current_artist or '—'}")
+            print(f"  {DIM}New: {R}{G}{value}{R}")
+            konfirm = input(f"\n  Apply this change? (Y/n): ").strip().lower()
+            if konfirm == "n":
+                print(f"  {DIM}Cancelled — nothing written.{R}")
+                return
             _set_artist_field(fp, value, mode)
             _stamp_comment(fp, "Edited & Embedded by TagMan")
-            lanjut = input(f"\n  Continue? (Y/n): ").strip().lower()
+            lanjut = input(f"\n  Edit another file? (Y/n): ").strip().lower()
             if lanjut == "n":
                 return
             fp2 = pick_file()
@@ -1354,12 +1383,16 @@ def set_tag(fp, tag_type):
         if not value:
             print("Cancelled.")
             return
+        konfirm = input(f"\n  Set {label} to '{value}'? (Y/n): ").strip().lower()
+        if konfirm == "n":
+            print(f"  {DIM}Cancelled — nothing written.{R}")
+            return
 
         _set_tag_single(fp, tag_type, value)
 
         _stamp_comment(fp, "Edited & Embedded by TagMan")
         print(f"{G}[+]{R} {label} set to: {value}")
-        lanjut = input(f"\n  Continue? (Y/n): ").strip().lower()
+        lanjut = input(f"\n  Edit another file? (Y/n): ").strip().lower()
         if lanjut == "n":
             return
         fp2 = pick_file(show_album=(tag_type == "album"))
@@ -1412,6 +1445,349 @@ def _get_tags(fp):
     """Return (title, artist) from tags."""
     t = _read_common_tags(fp)
     return t["title"], t["artist"]
+
+_FEAT_RE = re.compile(
+    r"[\(\[]?\s*(?:feat\.?|ft\.?|featuring)\s+([^\)\]]+)[\)\]]?",
+    re.IGNORECASE,
+)
+
+_TITLE_PREFIX_RE = re.compile(r"^\s*([^-–—]+?)\s[-–—]\s+(.+)$")
+
+# Words/phrases that show up after a dash as a *version/edit descriptor*,
+# not a song title -- e.g. "Bad Liar - Stripped" or "Halo - Live Acoustic".
+# When the part after the dash matches one of these, the text is really
+# "Song - Version" and NOT the "Artist - Song" shape the prefix method
+# looks for, so we must not mistake the song name for an artist name.
+_VERSION_WORDS = {
+    "stripped", "acoustic", "live", "remix", "remixed", "extended", "remaster",
+    "remastered", "demo", "cover", "instrumental", "unplugged", "sped", "up",
+    "slowed", "reverb", "nightcore", "karaoke", "clean", "explicit", "mono",
+    "stereo", "bonus", "track", "edit", "mix", "session", "alt", "alternate",
+    "bootleg", "mashup", "freestyle", "dub", "vip", "8d", "audio", "lofi",
+    "lo-fi", "chopped", "screwed", "radio", "original", "piano", "studio",
+    "album", "single", "deluxe", "reprise", "outro", "intro", "tv", "main",
+    "version", "cut", "take", "+", "&", "and", "with",
+}
+
+def _looks_like_version_tag(song):
+    """True if `song` reads as a version/edit descriptor ('Stripped',
+    'Live Acoustic', 'Sped Up + Reverb') rather than an actual song title --
+    i.e. every word in it is a known version-tag word, or it's a bare
+    4-digit remaster year like '2021 Remaster'."""
+    song = song.strip()
+    if not song:
+        return False
+    if re.match(r"^\d{4}\s+(remaster(?:ed)?|version|mix|edit)$", song, re.IGNORECASE):
+        return True
+    words = re.findall(r"[A-Za-z+&]+", song.lower())
+    if not words:
+        return False
+    return all(w in _VERSION_WORDS for w in words)
+
+_NAME_LIST_SPLIT_RE = re.compile(r",|&|\s/\s|\bx\b|\band\b", re.IGNORECASE)
+
+def _split_name_list(raw):
+    """Split a comma/&/x/and-separated artist list into names. A bare
+    slash with no surrounding spaces (e.g. 'Au/Ra', 'AC/DC') is treated as
+    part of the name rather than a separator -- only a *spaced* slash
+    ('Alan Walker / Au Ra') is treated as one."""
+    parts = _NAME_LIST_SPLIT_RE.split(raw)
+    return [p.strip(" .") for p in parts if p.strip(" .")]
+
+def _extract_featured_artists(text):
+    """Look for a 'feat./ft./featuring' clause inside a title (or filename
+    fallback) string and return the list of names it lists, e.g.
+    'Baby (feat. Marina, Luis Fonsi)' -> ['Marina', 'Luis Fonsi']. Returns
+    [] if no such clause is present. Lower confidence than the title-prefix
+    method below -- it's inferring extra artists from a parenthetical,
+    not an explicit list -- so validation only falls back to this when
+    there's no prefix to go on."""
+    if not text:
+        return []
+    m = _FEAT_RE.search(text)
+    if not m:
+        return []
+    raw = m.group(1).strip()
+    return _split_name_list(raw)
+
+def _extract_title_prefix_artists(text):
+    """Look for a 'Artist1, Artist2 - Song Name' shape -- the format this
+    app's own downloader/query builder uses (see `query = f"{artist} -
+    {title}"` in the lyrics fetch flow), and commonly how YouTube-sourced
+    titles/filenames come in. Returns the list of names listed before the
+    dash, e.g. 'Clean Bandit, MARINA, Luis Fonsi - Baby' -> ['Clean
+    Bandit', 'MARINA', 'Luis Fonsi']. Returns [] if the text doesn't look
+    like that, or if the part before the dash still contains a 'feat./ft.'
+    clause (then it isn't a clean artist list)."""
+    if not text:
+        return []
+    m = _TITLE_PREFIX_RE.match(text)
+    if not m:
+        return []
+    prefix = m.group(1).strip()
+    song = m.group(2).strip()
+    if not prefix or _FEAT_RE.search(prefix):
+        return []
+    if _looks_like_version_tag(song):
+        # e.g. "Bad Liar - Stripped": the part after the dash is a version/
+        # edit descriptor, not a song title, so this is "Song - Version",
+        # not "Artist - Song". Don't mistake the song name for an artist.
+        return []
+    return _split_name_list(prefix)
+
+def _validation_scan(files):
+    """Compare each file's Artist tag against artist names implied by its
+    Title (falling back to the filename if Title is blank), using two
+    detection methods tried in priority order:
+      1. Title prefix -- 'Artist1, Artist2 - Song' (near-certain signal).
+      2. '(feat. ...)' clause inside the title -- used only when there's
+         no prefix to go on; a real signal, but less certain than an
+         explicit artist list.
+    Returns a list of (fp, current_artist, missing_names, proposed_artist,
+    source_text, method, action) for every file where the Artist tag looks
+    incomplete or wrong. `method` is 'prefix', 'feat', or 'both', for
+    display purposes. `action` is 'add' when the current artist overlaps
+    with what was detected (just missing a collaborator) or 'replace' when
+    none of it overlaps (the current tag looks unrelated/wrong outright)."""
+    issues = []
+    for afp in files:
+        tags   = _read_common_tags(afp)
+        artist = tags["artist"].strip()
+        if not artist:
+            continue  # nothing to anchor a fix to -- skip rather than guess
+
+        # Check the Title tag *and* the filename -- not just the filename
+        # as a fallback when Title is blank. A file can have a clean Title
+        # ("Bye Bye Bye") that hides an artist mismatch that the filename
+        # ("*NSYNC - Bye Bye Bye.m4a") still reveals, so both are worth a
+        # look. Title is checked first since it's the more curated field.
+        title_text = tags["title"].strip()
+        name_text  = afp.stem
+        sources = [s for s in (title_text, name_text) if s]
+        # de-dupe while preserving order (title == filename stem is common)
+        seen = set()
+        sources = [s for s in sources if not (s in seen or seen.add(s))]
+
+        candidates, method, source = [], None, None
+        for src in sources:
+            prefix_names = _extract_title_prefix_artists(src)
+            feat_names   = _extract_featured_artists(src)
+            # Combine both signals from the same source text -- a title can
+            # legitimately have a prefix list *and* a separate feat. clause
+            # ("Katy Perry - California Gurls (feat. Snoop Dogg)"), and only
+            # checking prefix would silently drop Snoop Dogg.
+            combined = list(dict.fromkeys(prefix_names + feat_names))
+            if combined:
+                if prefix_names and feat_names:
+                    method = "both"
+                elif prefix_names:
+                    method = "prefix"
+                else:
+                    method = "feat"
+                candidates, source = combined, src
+                break
+        if not candidates:
+            continue
+
+        artist_lower = artist.lower()
+        missing = [n for n in candidates if n.lower() not in artist_lower]
+        if not missing:
+            continue
+
+        if len(missing) == len(candidates):
+            # None of the detected names overlap with the current Artist
+            # tag at all -- e.g. Artist="Jerusalem" but the title/filename
+            # says "*NSYNC". That's not a missing collaborator, it's an
+            # unrelated/wrong tag, so proposing "Jerusalem, *NSYNC" would
+            # just bolt the detected name onto garbage. Propose replacing
+            # the tag outright instead.
+            action = "replace"
+            proposed = ", ".join(candidates)
+        else:
+            action = "add"
+            proposed = artist + ", " + ", ".join(missing)
+        issues.append((afp, artist, missing, proposed, source, method, action))
+    return issues
+
+
+def _validation_fix_artist_issues(issues):
+    """Report + offer-to-fix flow for the Artist-tag-vs-title/filename part
+    of Validation. `issues` is the list _validation_scan() returns. Never
+    touches Album Artist -- only ever writes the Artist field -- and always
+    confirms before writing.
+
+    Two fix methods, picked once for the whole selected batch:
+      1. Automatic -- use the name(s) validation already detected (from the
+         title prefix, or the feat. clause as fallback).
+      2. Manual -- type the Artist value yourself, per file, with the
+         Title/filename shown alongside as a reference."""
+    method_label = {"prefix": "title prefix", "feat": "feat. clause", "both": "title prefix + feat."}
+    rows = []
+    for i, (afp, artist, missing, proposed, source, method, action) in enumerate(issues, 1):
+        name = _fit_name(afp.name)
+        tag  = f"{method_label[method]}, replace" if action == "replace" else method_label[method]
+        rows.append((f"  {i:>2}. {name}", f"  {P}{i:>2}{R}. {LV}{name}{R}"))
+        rows.append((f"      Now:  {artist}", f"      {DIM}Now:  {R}{artist}"))
+        rows.append((f"      New:  {proposed}  ({tag})",
+                      f"      {DIM}New:  {R}{G}{proposed}{R}  {DIM}({tag}){R}"))
+    _box("Validation — Artist Tag Issues", rows, min_width=50, icon="✓")
+
+    raw = _ask_optional(f"\n{V}  ❯{R} Fix which? Number(s) (e.g., 1,3,5), 'a' for all, or Enter to skip: ").strip()
+    if not raw or raw == "0":
+        print(f"  {DIM}Skipped.{R}")
+        return
+    if raw.lower() == "a":
+        picks = list(range(1, len(issues) + 1))
+    else:
+        picks = _parse_multi_input(raw, len(issues))
+    if not picks:
+        print(f"  {Y}[!]{R} No valid numbers.")
+        return
+    selected = [issues[i - 1] for i in picks]
+
+    _sub_box("Fix Method", [
+        (1, "Automatic", "use the name(s) detected from Title/filename"),
+        (2, "Manual",    "type the Artist yourself, per file"),
+        (0, "Back",      None),
+    ], width=56, icon="✓")
+    try:
+        method_choice = int(_ask(f"\n{V}  ❯{R} Pick: "))
+    except (ValueError, EOFError):
+        method_choice = 0
+    if method_choice == 0:
+        print(f"  {DIM}Cancelled.{R}")
+        return
+    if method_choice not in (1, 2):
+        print(f"  {Y}[!]{R} Invalid choice.")
+        return
+
+    if method_choice == 1:
+        print(f"\n{DIM}  About to update:{R}")
+        for afp, artist, missing, proposed, source, method, action in selected:
+            print(f"  {DIM}• {afp.name}{R}")
+            tag = f"  {Y}(replace){R}" if action == "replace" else ""
+            print(f"    {artist}  {DIM}->{R}  {G}{proposed}{R}{tag}")
+        konfirm = input(f"\n  Apply {len(selected)} change(s)? (Y/n): ").strip().lower()
+        if konfirm == "n":
+            print(f"  {DIM}Cancelled.{R}")
+            return
+
+        ok, fail = 0, []
+        for afp, artist, missing, proposed, source, method, action in selected:
+            try:
+                _set_artist_field(afp, proposed, "artist_only")
+                _stamp_comment(afp, "Edited & Embedded by TagMan")
+                ok += 1
+            except Exception as e:
+                fail.append((afp.name, str(e)))
+        print(f"\n  {G}[+]{R} {ok} file(s) updated.")
+        for name, err in fail:
+            print(f"  {Y}[!]{R} Failed {name}: {err}")
+        return
+
+    # method_choice == 2: manual, per file
+    ok, skipped = 0, 0
+    for afp, artist, missing, proposed, source, method, action in selected:
+        print(f"\n{DIM}  ── {afp.name} ──{R}")
+        print(f"  {DIM}Title/filename ref: {R}{source}")
+        print(f"  {DIM}Current Artist:     {R}{artist}")
+        value = input("  New Artist (Enter to skip this file): ").strip()
+        if not value:
+            print(f"  {DIM}Skipped.{R}")
+            skipped += 1
+            continue
+        print(f"  {DIM}New: {R}{G}{value}{R}")
+        konfirm = input("  Apply? (Y/n): ").strip().lower()
+        if konfirm == "n":
+            print(f"  {DIM}Skipped.{R}")
+            skipped += 1
+            continue
+        try:
+            _set_artist_field(afp, value, "artist_only")
+            _stamp_comment(afp, "Edited & Embedded by TagMan")
+            print(f"  {G}[+]{R} Artist set to: {value}")
+            ok += 1
+        except Exception as e:
+            print(f"  {Y}[!]{R} Failed: {e}")
+    print(f"\n  {G}[+]{R} {ok} file(s) updated.  {DIM}({skipped} skipped){R}")
+
+
+def _validation_fix_lyrics_issues(lyrics_issues):
+    """Report + offer-to-fetch flow for the lyrics part of Validation.
+    `lyrics_issues` is a list of (fp, status) where status is 'missing' or
+    'placeholder'. Reuses the exact same interactive fetch as the Lyrics
+    menu's auto-fetch-single mode."""
+    rows = []
+    for i, (afp, status) in enumerate(lyrics_issues, 1):
+        name  = _fit_name(afp.name)
+        label = "No lyrics found" if status == "missing" else "Placeholder only (TN) — no real lyrics"
+        rows.append((f"  {i:>2}. {name}", f"  {P}{i:>2}{R}. {LV}{name}{R}"))
+        rows.append((f"      {label}", f"      {DIM}{label}{R}"))
+    _box("Validation — Lyrics Issues", rows, min_width=50, icon="♪")
+
+    raw = _ask_optional(f"\n{V}  ❯{R} Fetch lyrics for which? Number(s), 'a' for all, or Enter to skip: ").strip()
+    if not raw or raw == "0":
+        print(f"  {DIM}Skipped.{R}")
+        return
+    if raw.lower() == "a":
+        picks = list(range(1, len(lyrics_issues) + 1))
+    else:
+        picks = _parse_multi_input(raw, len(lyrics_issues))
+    if not picks:
+        print(f"  {Y}[!]{R} No valid numbers.")
+        return
+
+    selected = [lyrics_issues[i - 1][0] for i in picks]
+    _sub_box("Provider Priority", [
+        (1, "Normal",              "syncedlyrics first"),
+        (2, "Prioritize LRCLib",   "LRCLib first"),
+    ], width=50, icon="♪")
+    try:
+        provider_choice = int(_ask(f"\n{V}  ❯{R} Pick (1/2): "))
+    except ValueError:
+        provider_choice = 1
+    prefer_lrclib = (provider_choice == 2)
+
+    _print_patience_banner()
+    for fp in selected:
+        print(f"\n{DIM}── {fp.name} ──{R}")
+        _fetch_lyrics_for_file(fp, prefer_lrclib=prefer_lrclib)
+
+
+def run_validation():
+    """Main-menu 'Validation': a read-only scan of the current folder that
+    reports two kinds of issues, then optionally offers to fix each --
+      1. Artist tag vs Title/filename: flags files whose Artist tag is
+         missing a featuring artist that shows up in the Title (falling
+         back to the filename if Title is blank), e.g. Artist = 'Clean
+         Bandit' but the title reads '... (feat. Sean Paul, Anne-Marie)'.
+      2. Lyrics: flags files with no lyrics at all, or with only the 'TN'
+         placeholder _embed_lyrics() stamps when nothing was found/entered.
+    The scan itself never writes anything -- it only reports -- and each
+    category is fixed independently, always with a confirmation step
+    before anything is written."""
+    files = scan_audio()
+    if not files:
+        print(f"\n{Y}[!]{R} {_scan_empty_message('No audio files in this folder.')}")
+        return
+
+    artist_issues = _validation_scan(files)
+    lyrics_issues = [(afp, status) for afp in files
+                      if (status := _lyrics_validation_status(afp))]
+
+    if not artist_issues and not lyrics_issues:
+        print(f"\n  {G}[+]{R} Validation complete — everything looks good.")
+        return
+
+    if artist_issues:
+        _validation_fix_artist_issues(artist_issues)
+    else:
+        print(f"\n  {G}[+]{R} Artist tags all look correct.")
+
+    if lyrics_issues:
+        _validation_fix_lyrics_issues(lyrics_issues)
+    else:
+        print(f"\n  {G}[+]{R} All files have lyrics.")
 
 def _get_duration(fp):
     """Return track duration in whole seconds, or None if it can't be read.
@@ -1971,6 +2347,23 @@ def _embed_lyrics(fp, lyrics):
         tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
         tags.save(str(fp))
 
+_TN_MARKER_RE = re.compile(r"^\[00:00\.00\]\s*TN\s*$")
+
+def _lyrics_validation_status(fp):
+    """Read-only check of a file's embedded lyrics for Validation. Returns
+    'missing' if there's no lyrics tag at all, 'placeholder' if the only
+    content is the 'TN' marker _embed_lyrics() stamps when nothing was
+    found/entered, or None if real lyrics are present."""
+    if not _has_lyrics(fp):
+        return "missing"
+    lyrics = _get_lyrics(fp) or ""
+    lines = lyrics.split("\n")
+    if lines and _TN_MARKER_RE.match(lines[0].strip()):
+        lines = lines[1:]
+    if not any(l.strip() for l in lines):
+        return "placeholder"
+    return None
+
 # ─── lyrics menu ──────────────────────────────────────────────────────────────
 
 def _manual_lyrics_fallback(fp, indent=""):
@@ -2023,6 +2416,57 @@ def _ask_custom_query_and_fetch(current_query, file_name, prefer_lrclib=False, d
             lyrics = _fetch_lyrics(q2, prefer_lrclib=prefer_lrclib, duration=duration)
             return _gate_plain_lyrics(lyrics, q2, prefer_lrclib=prefer_lrclib, duration=duration, indent="  ")
     return None
+
+def _fetch_lyrics_for_file(fp, prefer_lrclib=False):
+    """Single-file interactive auto-fetch: search, preview, confirm, embed --
+    falling back to manual entry if nothing turns up. This is the exact flow
+    the Lyrics menu's 'auto fetch single' mode uses, factored out here so
+    Validation can offer the same experience for files it flags as missing/
+    placeholder-only lyrics."""
+    title, artist = _get_tags(fp)
+    tags_empty = not (artist or title)
+    if not title:
+        title = fp.stem  # fallback to filename when title tag is missing
+    query = f"{artist} - {title}" if artist else title
+    print(f"\n  {DIM}Query: {query}{R}")
+    if tags_empty:
+        ovr = input("  Tags empty, using filename. Override? (y/N): ").strip().lower()
+        if ovr == "y":
+            query = _ask("  Manual query: ").strip() or query
+    if not query:
+        print("Skipped.")
+        return
+    fdur = _get_duration(fp)
+    print(f"{_ts()} {C}[~]{R} Searching: {query} ...")
+    lyrics = _fetch_lyrics(query, prefer_lrclib=prefer_lrclib, duration=fdur)
+    if not lyrics:
+        print(f"{Y}[!]{R} Lyrics not found.")
+        lyrics = _try_search_again_or_custom(query, fp.name, prefer_lrclib=prefer_lrclib, duration=fdur, indent="  ")
+        if lyrics is _LYRICS_DECLINED:
+            print(f"{DIM}[~] Skipped — no custom query.{R}")
+            return
+    lyrics = _gate_plain_lyrics(lyrics, query, prefer_lrclib=prefer_lrclib, duration=fdur, indent="  ")
+    if not lyrics:
+        print(f"{Y}[!]{R} Still not found. {_ts()}")
+        _manual_lyrics_fallback(fp)
+        return
+    _preview_lyrics(lyrics, _LAST_LYRICS_SOURCE)
+    konfirm = input("\nEmbed these lyrics? (Y/n): ").strip().lower()
+    if konfirm == "n":
+        custom = _ask_custom_query_and_fetch(query, fp.name, prefer_lrclib=prefer_lrclib, duration=fdur)
+        if custom:
+            lyrics = custom
+            _preview_lyrics(lyrics, _LAST_LYRICS_SOURCE)
+            konfirm = input("\nEmbed these lyrics? (Y/n): ").strip().lower()
+            if konfirm != "n":
+                _embed_lyrics(fp, lyrics)
+                print(f"{G}[+]{R} Lyrics embedded to {fp.name}! {_ts()}")
+                return
+        print("Skipped.")
+        return
+    _embed_lyrics(fp, lyrics)
+    print(f"{G}[+]{R} Lyrics embedded to {fp.name}! {_ts()}")
+
 
 def add_lyrics(fp=None):
     print("\nLyrics mode:")
@@ -2189,49 +2633,7 @@ def add_lyrics(fp=None):
 
         _print_patience_banner()
         for fp in fps:
-            title, artist = _get_tags(fp)
-            tags_empty = not (artist or title)
-            if not title:
-                title = fp.stem  # fallback to filename when title tag is missing
-            query = f"{artist} - {title}" if artist else title
-            print(f"\n  {DIM}Query: {query}{R}")
-            if tags_empty:
-                ovr = input("  Tags empty, using filename. Override? (y/N): ").strip().lower()
-                if ovr == "y":
-                    query = _ask("  Manual query: ").strip() or query
-            if not query:
-                print("Skipped.")
-                continue
-            fdur = _get_duration(fp)
-            print(f"{_ts()} {C}[~]{R} Searching: {query} ...")
-            lyrics = _fetch_lyrics(query, prefer_lrclib=prefer_lrclib, duration=fdur)
-            if not lyrics:
-                print(f"{Y}[!]{R} Lyrics not found.")
-                lyrics = _try_search_again_or_custom(query, fp.name, prefer_lrclib=prefer_lrclib, duration=fdur, indent="  ")
-                if lyrics is _LYRICS_DECLINED:
-                    print(f"{DIM}[~] Skipped — no custom query.{R}")
-                    continue
-            lyrics = _gate_plain_lyrics(lyrics, query, prefer_lrclib=prefer_lrclib, duration=fdur, indent="  ")
-            if not lyrics:
-                print(f"{Y}[!]{R} Still not found. {_ts()}")
-                _manual_lyrics_fallback(fp)
-                continue
-            _preview_lyrics(lyrics, _LAST_LYRICS_SOURCE)
-            konfirm = input("\nEmbed these lyrics? (Y/n): ").strip().lower()
-            if konfirm == "n":
-                custom = _ask_custom_query_and_fetch(query, fp.name, prefer_lrclib=prefer_lrclib, duration=fdur)
-                if custom:
-                    lyrics = custom
-                    _preview_lyrics(lyrics, _LAST_LYRICS_SOURCE)
-                    konfirm = input("\nEmbed these lyrics? (Y/n): ").strip().lower()
-                    if konfirm != "n":
-                        _embed_lyrics(fp, lyrics)
-                        print(f"{G}[+]{R} Lyrics embedded to {fp.name}! {_ts()}")
-                        continue
-                print("Skipped.")
-                continue
-            _embed_lyrics(fp, lyrics)
-            print(f"{G}[+]{R} Lyrics embedded to {fp.name}! {_ts()}")
+            _fetch_lyrics_for_file(fp, prefer_lrclib=prefer_lrclib)
         return
 
     # ── mode 2: load .lrc/.txt files ─────────────────────────────────
@@ -2499,6 +2901,7 @@ MENU = [
     ("Lyrics",                 "Fetch, embed & edit lyrics (auto / file / batch)", "♪"),
     ("Export/Import Metadata", "Save or load tags + cover to/from file",     "⇄"),
     ("Sorcerer",               "Search & download songs from YouTube Music", "✧"),
+    ("Validation",             "Check Artist tags & lyrics for issues",      "✓"),
     ("Settings",               "App preferences & defaults",                 "⚙"),
 ]
 
@@ -4894,7 +5297,16 @@ def _finalize_downloaded_files():
         try:
             target = dest / f.name
             if target.exists():
-                target = dest / f"{f.stem}_{int(time.time())}{f.suffix}"
+                # Clean, human-readable dedup: "Title.ext" -> "Title (2).ext",
+                # "Title (3).ext", ... instead of a raw epoch timestamp (which
+                # produced unreadable names like "Babydoll_1784538637.opus").
+                n = 2
+                while True:
+                    candidate = dest / f"{f.stem} ({n}){f.suffix}"
+                    if not candidate.exists():
+                        target = candidate
+                        break
+                    n += 1
             shutil.move(str(f), str(target))
             moved += 1
         except Exception:
@@ -5169,6 +5581,10 @@ def main():
                 continue
 
             if choice == 8:
+                run_validation()
+                continue
+
+            if choice == 9:
                 settings_menu()
                 continue
 
