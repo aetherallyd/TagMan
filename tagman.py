@@ -16,6 +16,7 @@ import json
 import unicodedata
 import platform
 import tempfile
+import shlex
 from pathlib import Path
 
 # ─── Environment Detection ──────────────────────────────────────────────────
@@ -110,6 +111,7 @@ DEFAULT_CONFIG = {
     "rename_mode": "ask",            # "ask" (always prompt) / "auto" (do silently) / "off" (do nothing)
     "video_search_mode": "ask",      # "ask" (prompt each search) / "always" (always search videos too) / "never" (songs-only, old behavior)
     "folder_reset_mode": "ignore",   # "always_ask" (cd back to $HOME once the task using the picked folder is done, every environment) / "ignore" (stay in that folder until the user exits, old behavior)
+    "external_storage_id": None,     # None (no external storage bound) / a platform-specific identifier for an SD card/OTG/external drive (Termux: "1234-ABCD" from /storage/<ID>; Windows: drive letter like "D"; macOS: /Volumes/<Name>; Linux: mount name under /media) -- set via Settings -> Bind External Storage, resolved per-platform by _resolve_external_storage_path()
 }
 
 def _load_config():
@@ -130,13 +132,54 @@ def _load_config():
             pass
     return cfg
 
+_LAST_SAVE_ERROR = None  # human-readable reason the most recent _save_config() call
+                          # failed, if it did -- set here instead of being swallowed by
+                          # a bare 'except Exception: return False', so callers that want
+                          # to show *why* a save failed (not just that it failed) can.
+
 def _save_config(cfg):
-    """Write config to CONFIG_PATH with clean JSON formatting."""
+    """Write config to CONFIG_PATH with clean JSON formatting, then read the
+    file back and compare it against what was just written. A plain
+    try/except around the write alone only catches exceptions (permission
+    errors, disk full, etc.) -- it can't catch a write that "succeeds"
+    (no exception) but doesn't actually durably land on disk, which is a
+    real possibility on some Android FUSE-backed storage. Reading back and
+    comparing turns that into a detectable failure instead of a false
+    'saved' result."""
+    global _LAST_SAVE_ERROR
+    _LAST_SAVE_ERROR = None
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())  # force the write out of the page cache and onto
+                                   # actual storage -- without this, a write can
+                                   # report success and even read back correctly
+                                   # in-process, but still not have hit disk yet;
+                                   # if Termux/Android kills or restarts the process
+                                   # before the OS gets around to flushing it on its
+                                   # own, the file reverts to its last durable state.
+        try:
+            dir_fd = os.open(str(CONFIG_PATH.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)   # also fsync the containing directory, since on
+                                   # some filesystems the file's data can be durable
+                                   # while the directory entry pointing at it isn't
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass  # directory fsync is best-effort; not all platforms support it
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            written_back = json.load(f)
+        if written_back != cfg:
+            _LAST_SAVE_ERROR = (
+                f"read-back mismatch -- wrote {cfg!r} but file on disk now "
+                f"contains {written_back!r} (write likely didn't durably land)"
+            )
+            return False
         return True
-    except Exception:
+    except Exception as e:
+        _LAST_SAVE_ERROR = f"{type(e).__name__}: {e}"
         return False
 
 CONFIG = _load_config()
@@ -252,6 +295,18 @@ PATIENCE_BANNER = f"""
 def _print_patience_banner():
     print(PATIENCE_BANNER)
 
+# Shown at the top of Settings -> Bind External Storage, so entering the
+# <ID> for an SD card/OTG path feels like its own little interactive step
+# rather than a plain text prompt buried in Settings.
+EXTERNAL_STORAGE_BANNER = f"""
+{V}   ╔══════════════════════════════════════════╗
+{V}   ║{LV}{'Bind External Storage':^42}{V}║
+{V}   ║{DIM}{'┌─────────────┐':^42}{V}║
+{V}   ║{DIM}{'│  SD  ▓▓▓▓▓  │':^42}{V}║
+{V}   ║{DIM}{'└─────────────┘':^42}{V}║
+{V}   ╚══════════════════════════════════════════╝{R}
+"""
+
 # ─── shared UI helper ─────────────────────────────────────────────────────────
 
 MAIN_MENU_CODE = "324"  # type this at any number/search prompt to return to main menu
@@ -309,17 +364,19 @@ def _sub_box(title, items, width=50, icon="✦"):
     head = f"═ {icon} {title} "
     fill = max(0, width - _vlen(head))
     print(f"\n{V}  ╔{head}{'═' * fill}╗{R}")
+    key_w = max((len(str(key)) for key, _, _ in items), default=1)
     for key, label, desc in items:
         col = DIM if str(key) == "0" else LV
-        label = _fit_name(label, maxlen=max(8, width - 6))
-        plain1 = f"  {key}. {label}"
+        key_str = str(key).rjust(key_w)
+        label = _fit_name(label, maxlen=max(8, width - 6 - (key_w - 1)))
+        plain1 = f"  {key_str}. {label}"
         pad1 = max(0, width - _vlen(plain1))
-        print(f"{V}  ║{R}  {P}{key}{V}.{R} {col}{label}{R}{' ' * pad1}{V}║{R}")
+        print(f"{V}  ║{R}  {P}{key_str}{V}.{R} {col}{label}{R}{' ' * pad1}{V}║{R}")
         if desc:
-            desc = _fit_name(desc, maxlen=max(8, width - 5))
-            plain2 = f"     {desc}"
+            desc = _fit_name(desc, maxlen=max(8, width - 5 - (key_w - 1)))
+            plain2 = f"  {' ' * key_w}  {desc}"
             pad2 = max(0, width - _vlen(plain2))
-            print(f"{V}  ║{R}     {DIM}{desc}{R}{' ' * pad2}{V}║{R}")
+            print(f"{V}  ║{R}  {' ' * key_w}  {DIM}{desc}{R}{' ' * pad2}{V}║{R}")
     print(f"{V}  ╚{'═' * width}╝{R}")
 
 def _box(title, rows, min_width=44, max_width=72, icon="✦"):
@@ -537,6 +594,7 @@ def _maybe_pick_scan_folder():
         start = Path.home() / "storage" / "shared"
     else:
         start = Path.home()
+    start = _pick_storage_root(start)
 
     target = _pick_folder_interactive(start)
     os.system("clear")
@@ -763,7 +821,7 @@ def _embed_cover(fp, cover_path):
         audio = MP4(str(fp))
         with open(cover_path, "rb") as f:
             audio["covr"] = [MP4Cover(f.read(), imageformat=fmt)]  # single key: always fully replaces
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     elif ext == ".flac":
         from mutagen.flac import FLAC, Picture
         audio = FLAC(str(fp))
@@ -775,7 +833,7 @@ def _embed_cover(fp, cover_path):
         with open(cover_path, "rb") as f:
             pic.data = f.read()
         audio.add_picture(pic)
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     elif ext == ".opus":
         from mutagen.flac import Picture
         from mutagen.oggopus import OggOpus
@@ -788,7 +846,7 @@ def _embed_cover(fp, cover_path):
         with open(cover_path, "rb") as f:
             pic.data = f.read()
         _opus_set_picture(audio, pic)
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     else:
         from mutagen.mp3 import MP3
         from mutagen.id3 import ID3, APIC, error as ID3Error
@@ -805,7 +863,7 @@ def _embed_cover(fp, cover_path):
                 del audio.tags[key]
         with open(cover_path, "rb") as f:
             audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=f.read()))
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     _history_log("cover", "Cover art embedded", file=Path(fp).name)
 
 def _has_cover_art(fp):
@@ -1174,7 +1232,7 @@ def _set_tag_single(fp, tag_type, value):
             audio[m4a_keys[tag_type]] = [value]
             if tag_type == "artist":
                 audio["aART"] = [value]
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     elif ext in (".flac", ".opus"):
         audio = _open_vorbis(fp, ext)
         if tag_type in ("track", "disc"):
@@ -1189,7 +1247,7 @@ def _set_tag_single(fp, tag_type, value):
             audio[vorbis_keys[tag_type]] = [value]
             if tag_type == "artist":
                 audio["albumartist"] = [value]
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     else:
         from mutagen.id3 import ID3, TIT2, TPE1, TALB, TPE2, TCOM, TCON, TDRC, TRCK, TPOS, TCOP
         audio = ID3(str(fp))
@@ -1206,7 +1264,7 @@ def _set_tag_single(fp, tag_type, value):
             audio[key] = cls(encoding=3, text=value)
             if tag_type == "artist":
                 audio["TPE2"] = TPE2(encoding=3, text=value)
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     _history_log("edit", f"{tag_type.capitalize()} set to \"{value}\"", file=Path(fp).name)
 
 def _batch_set_simple(tag_type, label):
@@ -1400,14 +1458,14 @@ def _set_artist_field(fp, value, mode):
             audio["\xa9ART"] = [value]
         if mode in ("both", "aa_only"):
             audio["aART"] = [value]
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     elif ext in (".flac", ".opus"):
         audio = _open_vorbis(fp, ext)
         if mode in ("both", "artist_only"):
             audio["artist"] = [value]
         if mode in ("both", "aa_only"):
             audio["albumartist"] = [value]
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     else:
         from mutagen.id3 import ID3, TPE1, TPE2
         audio = ID3(str(fp))
@@ -1415,7 +1473,7 @@ def _set_artist_field(fp, value, mode):
             audio["TPE1"] = TPE1(encoding=3, text=value)
         if mode in ("both", "aa_only"):
             audio["TPE2"] = TPE2(encoding=3, text=value)
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     if mode == "both":
         print(f"  {G}[+]{R} Artist set to: {value}")
         print(f"  {DIM}[~] Album Artist also updated → {value}{R}")
@@ -1908,14 +1966,14 @@ def _stamp_comment(fp, message, force=False):
             if not force and "tagman" in existing.lower():
                 return
             audio["\xa9cmt"] = [message]
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
         elif ext in (".flac", ".opus"):
             audio    = _open_vorbis(fp, ext)
             existing = str(audio.get("comment", [""])[0]) if audio.get("comment") else ""
             if not force and "tagman" in existing.lower():
                 return
             audio["comment"] = [message]
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
         else:
             from mutagen.id3 import ID3, COMM
             audio    = ID3(str(fp))
@@ -1924,7 +1982,7 @@ def _stamp_comment(fp, message, force=False):
             if not force and "tagman" in existing.lower():
                 return
             audio["COMM::eng"] = COMM(encoding=3, lang="eng", desc="", text=message)
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
     except Exception:
         pass
 
@@ -1955,7 +2013,7 @@ def _ensure_fallback_fields(fp, fields=("copyright",), fallback="TN"):
                 val = str(audio.get(key, [""])[0]) if audio.get(key) else ""
                 if _is_blank(val):
                     audio[key] = [fallback]
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
         elif ext in (".flac", ".opus"):
             flac_keys = {"copyright": "copyright", "composer": "composer", "genre": "genre"}
             audio = _open_vorbis(fp, ext)
@@ -1966,7 +2024,7 @@ def _ensure_fallback_fields(fp, fields=("copyright",), fallback="TN"):
                 val = str(audio.get(key, [""])[0]) if audio.get(key) else ""
                 if _is_blank(val):
                     audio[key] = [fallback]
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
         else:
             cls_map = {"copyright": ("TCOP", TCOP), "composer": ("TCOM", TCOM), "genre": ("TCON", TCON)}
             audio = ID3(str(fp))
@@ -1978,7 +2036,7 @@ def _ensure_fallback_fields(fp, fields=("copyright",), fallback="TN"):
                 val = str(cur.text[0]) if cur and cur.text else ""
                 if _is_blank(val):
                     audio[key] = cls(encoding=3, text=fallback)
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
     except Exception:
         pass
 
@@ -2423,11 +2481,11 @@ def _embed_lyrics(fp, lyrics):
         from mutagen.mp4 import MP4
         audio = MP4(str(fp))
         audio["\xa9lyr"] = [lyrics]
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     elif ext in (".flac", ".opus"):
         audio = _open_vorbis(fp, ext)
         audio["lyrics"] = [lyrics]
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     else:
         from mutagen.id3 import ID3, USLT
         from mutagen.mp3 import MP3
@@ -3170,7 +3228,7 @@ def _apply_meta_from_json(fp, json_path):
                 audio["tmpo"] = [int(float(meta["bpm"]))]
             except (ValueError, TypeError):
                 pass
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     elif ext in (".flac", ".opus"):
         audio = _open_vorbis(fp, ext)
         tag_map = {
@@ -3190,7 +3248,7 @@ def _apply_meta_from_json(fp, json_path):
                 audio["bpm"] = [str(int(float(meta["bpm"])))]
             except (ValueError, TypeError):
                 pass
-        audio.save()
+        _save_audio_with_root_fallback(audio, fp)
     else:
         from mutagen.mp3 import MP3
         audio = MP3(str(fp), ID3=ID3)
@@ -3396,7 +3454,7 @@ def meta_load():
                         continue
                     tag = M4A_MAP.get(k)
                     if tag: audio[tag] = [str(v)]
-                audio.save()
+                _save_audio_with_root_fallback(audio, fp)
             elif ext in (".flac", ".opus"):
                 FLAC_MAP = {"title": "title", "artist": "artist", "album": "album",
                             "year": "date", "genre": "genre", "comment": "comment",
@@ -3406,7 +3464,7 @@ def meta_load():
                     if k in SKIP or not v: continue
                     tag = FLAC_MAP.get(k)
                     if tag: audio[tag] = [str(v)]
-                audio.save()
+                _save_audio_with_root_fallback(audio, fp)
             else:
                 from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TCON, TPE2, TRCK
                 ID3_MAP = {"title": ("TIT2", TIT2), "artist": ("TPE1", TPE1),
@@ -4519,18 +4577,18 @@ def _apply_ytmusic_artists(fp, artist_names):
             audio = MP4(str(fp))
             audio["\xa9ART"] = [artist_val]
             audio["aART"] = [album_artist_val]
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
         elif ext in (".flac", ".opus"):
             audio = _open_vorbis(fp, ext)
             audio["artist"] = [artist_val]
             audio["albumartist"] = [album_artist_val]
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
         else:
             from mutagen.id3 import ID3, TPE1, TPE2
             audio = ID3(str(fp))
             audio["TPE1"] = TPE1(encoding=3, text=artist_val)
             audio["TPE2"] = TPE2(encoding=3, text=album_artist_val)
-            audio.save()
+            _save_audio_with_root_fallback(audio, fp)
         print(f"  {DIM}[~] Artist tag corrected from YTMusic data → {artist_val}{R}")
     except Exception as e:
         print(f"  {Y}[!]{R} Couldn't apply YTMusic artist data: {e}")
@@ -5230,6 +5288,106 @@ def _settings_video_search_mode():
     _save_config(CONFIG)
     print(f"  {G}[+]{R} Video search mode set to '{CONFIG['video_search_mode']}'.")
 
+def _bind_external_storage_enter_id():
+    """The actual 'type in the identifier' step, split out from the
+    Bind/Unbind/Back menu below so picking '1. Bind / rebind' there feels
+    like its own little screen (tutorial + prompt), same as before."""
+    os.system("clear")
+    print(EXTERNAL_STORAGE_BANNER)
+
+    print(f"  {LV}[i]{R} How to find what to enter:")
+    for line in _external_storage_tutorial_lines():
+        print(f"  {DIM}{line}{R}")
+
+    raw = input(f"\n  {V}❯{R} Enter it here (empty to cancel): ").strip()
+    if raw == "":
+        print(f"  {DIM}Cancelled.{R}")
+        return
+
+    ext_path = _resolve_external_storage_path(raw)
+    if not ext_path.exists():
+        konfirm = input(f"  {Y}[!]{R} {ext_path} doesn't exist on this device right now. Save anyway? (y/N): ").strip().lower()
+        if konfirm != "y":
+            print(f"  {DIM}Cancelled.{R}")
+            return
+
+    CONFIG["external_storage_id"] = raw
+    if _save_config(CONFIG):
+        print(f"  {G}[+]{R} External storage bound: {LV}{ext_path}{R}")
+        print(f"  {DIM}Saved to: {CONFIG_PATH}{R}")
+        print(f"  {DIM}Next time a folder browser opens (scan-folder picker, Folder{R}")
+        print(f"  {DIM}Shortcut), you'll get an Internal/External choice first.{R}")
+    else:
+        print(f"  {Y}[!]{R} Bound for this session, but saving to disk failed --")
+        print(f"  {Y}[!]{R} it will revert to unbound next time you launch TagMan.")
+        print(f"  {DIM}Tried to save to: {CONFIG_PATH}{R}")
+        if _LAST_SAVE_ERROR:
+            print(f"  {DIM}Reason: {_LAST_SAVE_ERROR}{R}")
+
+def _settings_bind_external_storage():
+    """Settings sub-feature: remember an SD card/OTG/other-drive identifier
+    so every folder-browsing feature (scan-folder picker, Folder Shortcut)
+    can offer a quick Internal-vs-External choice instead of digging
+    through storage manually each time -- see _pick_storage_root().
+    What exactly gets entered/stored differs per platform; see
+    _external_storage_tutorial_lines() and _resolve_external_storage_path()
+    for the Termux/Windows/macOS/Linux specifics.
+
+    This is its own Bind/Unbind/Back menu (rather than folding unbind into
+    the text prompt as a special '0' input) specifically so '0' keeps
+    meaning "Back" here exactly like it does in every other menu in
+    TagMan -- overloading '0' as "unbind" was a footgun: reflexively typing
+    0 to back out (as you would anywhere else) would silently wipe the
+    binding you just set.
+
+    The identifier only needs to be looked up once per card/drive -- it
+    stays the same across reboots/reinserts for that same card (Termux
+    <ID>, Windows drive letter) or that same volume name (macOS/Linux),
+    though a drive letter can change if you plug in a different device."""
+    while True:
+        current = CONFIG.get("external_storage_id")
+
+        os.system("clear")
+        print(EXTERNAL_STORAGE_BANNER)
+        if current:
+            print(f"  {LV}[i]{R} Currently bound: {DIM}{_resolve_external_storage_path(current)}{R}")
+        else:
+            print(f"  {DIM}Not bound yet.{R}")
+        print(f"  {DIM}Config file: {CONFIG_PATH}{R}\n")
+
+        _sub_box("Bind External Storage", [
+            (1, "Bind / rebind",  "enter a new SD card / OTG / drive identifier"),
+            (2, "Unbind",         "clear the currently bound external path" if current else "nothing bound yet"),
+            (0, "Back",           None),
+        ], width=60, icon="◈")
+
+        try:
+            c = int(_ask(f"\n{V}  ❯{R} Pick: "))
+        except ValueError:
+            return
+        if c == 0:
+            return
+        elif c == 1:
+            _bind_external_storage_enter_id()
+        elif c == 2:
+            if not current:
+                print(f"  {Y}[!]{R} Nothing bound yet.")
+                continue
+            konfirm = input(f"  Unbind external storage ({_resolve_external_storage_path(current)})? (y/N): ").strip().lower()
+            if konfirm != "y":
+                print(f"  {DIM}Cancelled.{R}")
+                continue
+            CONFIG["external_storage_id"] = None
+            if _save_config(CONFIG):
+                print(f"  {G}[+]{R} External storage unbound.")
+            else:
+                print(f"  {Y}[!]{R} Unbound for this session, but saving to disk failed --")
+                print(f"  {Y}[!]{R} it may come back bound next time you launch TagMan.")
+                if _LAST_SAVE_ERROR:
+                    print(f"  {DIM}Reason: {_LAST_SAVE_ERROR}{R}")
+        else:
+            print(f"  {Y}[!]{R} Invalid choice.")
+
 # ─── Cleaner (Settings sub-menu) ──────────────────────────────────────────
 
 def _find_youtube_txt_files():
@@ -5396,6 +5554,237 @@ def _list_subdirs(path):
         return items
     except Exception:
         return []
+
+def _resolve_external_storage_path(ext_id):
+    """Turn whatever's stored in CONFIG['external_storage_id'] into an
+    actual filesystem Path for the CURRENT platform.
+
+    What gets stored is whatever the user entered in Settings -> Bind
+    External Storage, which differs per platform (see
+    _external_storage_tutorial_lines()):
+      - Termux/Android: an <ID> like "1234-ABCD" -> /storage/<ID>
+      - Windows: a drive letter like "D" (or "D:") -> D:\\
+      - macOS: a volume name -> /Volumes/<Name>
+      - Linux: a mount name -> looked up under /media/$USER, /run/media/
+        $USER, or /mnt (whichever actually exists)
+    A full absolute path pasted in instead of a bare name/letter is always
+    used as-is, on every platform -- this is the escape hatch for setups
+    that don't match the common case above (e.g. a custom mount point)."""
+    ext_id = ext_id.strip()
+
+    if IS_WINDOWS:
+        # Accept "D", "D:", or "D:\..." -- normalize to a bare "D:\" root,
+        # unless it's already a longer path (e.g. "D:\Music") they pasted.
+        if len(ext_id) >= 2 and ext_id[1] == ":":
+            return Path(ext_id if len(ext_id) > 2 else ext_id + "\\")
+        return Path(f"{ext_id.rstrip(':')}:\\")
+
+    if os.path.isabs(ext_id):
+        return Path(ext_id)
+
+    if IS_TERMUX:
+        return Path("/storage") / ext_id
+
+    if IS_MACOS:
+        return Path("/Volumes") / ext_id
+
+    # Generic Linux/Unix (regular Linux distros, and everything platform.system()
+    # doesn't give its own branch -- FreeBSD/OpenBSD/NetBSD, etc., all fall
+    # through _detect_environment() to this same bucket). Desktop distros
+    # auto-mount under /media/$USER or /run/media/$USER; BSDs and headless/
+    # server setups more often have nothing auto-mounted and expect a
+    # manual `mount` into /mnt (or wherever the user chose) instead -- so
+    # this tries the desktop convention first, then /mnt as the general
+    # manual-mount fallback.
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    candidates = []
+    if user:
+        candidates.append(Path("/media") / user / ext_id)
+        candidates.append(Path("/run/media") / user / ext_id)
+    candidates.append(Path("/mnt") / ext_id)
+    candidates.append(Path("/media") / ext_id)
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # best guess so "save anyway" still has something to store/show
+
+# ─── Root-Access Fallback (Termux/Android only) ────────────────────────────
+# Android sandboxes app storage access via scoped storage / SAF -- Termux
+# normally only gets read-only access to removable SD cards (unlike internal
+# shared storage, which is full read/write after termux-setup-storage). A
+# rooted device can bypass this via `su`, so if root is available, TagMan
+# offers it as a fallback specifically when a move to external storage fails
+# with a permission error. This is entirely a Termux/Android quirk -- Linux,
+# macOS, and Windows never had this restriction, so none of this runs there.
+
+_ROOT_ACCESS_CHECKED = False
+_ROOT_ACCESS_AVAILABLE = False
+
+def _has_root_access():
+    """Checks (once per session, then cached) whether `su` grants root on
+    this device. Termux-only -- returns False immediately elsewhere, since
+    no other supported platform has the scoped-storage restriction this is
+    meant to work around. Caching matters because each check spawns a
+    process and, on most root managers (Magisk/KernelSU), can pop a
+    permission prompt on the phone -- we don't want that firing repeatedly."""
+    global _ROOT_ACCESS_CHECKED, _ROOT_ACCESS_AVAILABLE
+    if not IS_TERMUX:
+        return False
+    if _ROOT_ACCESS_CHECKED:
+        return _ROOT_ACCESS_AVAILABLE
+    _ROOT_ACCESS_CHECKED = True
+    try:
+        result = subprocess.run(
+            ["su", "-c", "id"],
+            capture_output=True, text=True, timeout=15
+        )
+        _ROOT_ACCESS_AVAILABLE = result.returncode == 0 and "uid=0" in result.stdout
+    except Exception:
+        _ROOT_ACCESS_AVAILABLE = False
+    return _ROOT_ACCESS_AVAILABLE
+
+def _move_via_root(src, dest):
+    """Moves a single file using `su -c mv`, for the case where a plain
+    shutil.move() failed with PermissionError on an SD-card-style path that
+    Termux can only read, not write, without root. shlex.quote on both
+    sides so filenames with spaces/quotes/apostrophes (common in song
+    titles) don't break the shell command run under su. Returns True only
+    if `mv` reported success AND the file is actually visible at dest
+    afterward -- some root shells report a misleadingly clean exit code
+    even when the underlying FUSE layer silently drops the write."""
+    cmd = f"mv -- {shlex.quote(str(src))} {shlex.quote(str(dest))}"
+    try:
+        result = subprocess.run(
+            ["su", "-c", cmd],
+            capture_output=True, text=True, timeout=30
+        )
+        return result.returncode == 0 and dest.exists()
+    except Exception:
+        return False
+
+def _is_under_bound_external_storage(path):
+    """True only if `path` sits inside the SD card/external storage the user
+    explicitly bound via Settings -> Bind External Storage. This is the
+    gate for root usage: root is a fallback for THAT specific location, not
+    a general "permission error happened, try su" catch-all. No binding
+    configured, or the resolved external path doesn't exist -> always False,
+    so su is never invoked outside a path the user deliberately pointed at."""
+    ext_id = CONFIG.get("external_storage_id")
+    if not ext_id:
+        return False
+    try:
+        ext_path = _resolve_external_storage_path(ext_id).resolve()
+        if not ext_path.exists():
+            return False
+        return ext_path == path.resolve() or ext_path in path.resolve().parents
+    except Exception:
+        return False
+
+def _save_audio_with_root_fallback(audio, fp):
+    """Wraps every mutagen `audio.save()` call in TagMan.
+
+    On every platform except Termux/Android, this is just `audio.save()` --
+    no other OS has a permission wall here, so there's nothing to skip past.
+
+    On Termux, if fp is inside the bound external storage AND root is
+    available, we already know a plain save() will hit PermissionError (SD
+    cards are R/O to apps on Android), so we go straight to the root path
+    instead of wasting a doomed attempt first: save to a private temp copy
+    on internal storage (always writable), then `su -c mv` that temp copy
+    over the original -- overwriting it with the edited version.
+
+    Otherwise (not under bound external storage, or root unavailable): try
+    the normal save first, since on Termux that's still the right call for
+    internal storage or an unbound SD card path, and PermissionError there
+    should propagate as a real error rather than being assumed."""
+    skip_to_root = IS_TERMUX and _is_under_bound_external_storage(Path(fp)) and _has_root_access()
+    if not skip_to_root:
+        try:
+            audio.save()
+            return
+        except PermissionError:
+            if not (IS_TERMUX and _is_under_bound_external_storage(Path(fp)) and _has_root_access()):
+                raise
+    tmp_dir = Path(tempfile.mkdtemp(prefix="tagman_root_"))
+    try:
+        tmp_path = tmp_dir / Path(fp).name
+        audio.save(str(tmp_path))
+        if not _move_via_root(tmp_path, Path(fp)):
+            raise PermissionError(
+                f"root move-back failed while saving {Path(fp).name} to external storage"
+            )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+def _external_storage_tutorial_lines():
+    """Per-platform instructions for finding what to enter in
+    Settings -> Bind External Storage, shown by _settings_bind_external_storage()."""
+    if IS_TERMUX:
+        return [
+            "1. Open your file manager app.",
+            "2. Go to its storage/root view (often called 'Internal storage').",
+            "3. Look for your SD card / OTG entry -- the path shown under it",
+            "   looks like /storage/<ID>, e.g. /storage/1234-ABCD.",
+            "4. That last segment (the <ID> part) is what you enter below.",
+            "   ('ls /storage' in Termux itself lists every mounted ID too.)",
+        ]
+    if IS_WINDOWS:
+        return [
+            "1. Open File Explorer -> 'This PC'.",
+            "2. Find the drive you want (SD card, USB, second disk) --",
+            "   its letter shows next to the name, e.g. 'D:'.",
+            "3. Enter just that letter below (e.g. D) -- the colon/backslash",
+            "   is added automatically.",
+        ]
+    if IS_MACOS:
+        return [
+            "1. Open Finder -> Locations, or check /Volumes in Terminal.",
+            "2. Your SD card/USB drive shows up as /Volumes/<Name>.",
+            "3. Enter <Name> exactly as shown below (case-sensitive).",
+        ]
+    # Generic Linux/Unix (desktop distros, BSDs, headless/server setups)
+    return [
+        "1. Desktop distros usually auto-mount removable drives under",
+        "   /media/$USER/<Name> or /run/media/$USER/<Name> -- check your",
+        "   file manager, or run 'lsblk' / 'ls /media/$USER' in a terminal.",
+        "2. BSDs and headless/server setups often don't auto-mount at all --",
+        "   mount it yourself first (e.g. 'sudo mount /dev/sdb1 /mnt/sdcard'),",
+        "   then use that mount point.",
+        "3. Enter <Name> exactly as shown, OR paste the full mount path",
+        "   directly (e.g. /mnt/sdcard) -- either works.",
+    ]
+
+def _pick_storage_root(internal_start):
+    """If an external storage ID is bound (Settings -> Bind External
+    Storage), ask whether to browse Internal storage or the bound External
+    path (SD card/OTG/other drive) before opening the interactive folder
+    browser, and return whichever root the user picked as the starting Path.
+
+    If no external ID is bound yet, this is a silent no-op that returns
+    internal_start unchanged -- so nothing changes for anyone who hasn't
+    set this up. If the bound path no longer exists (drive unplugged, ID
+    changed), falls back to Internal with a warning instead of handing the
+    folder browser a dead path."""
+    ext_id = CONFIG.get("external_storage_id")
+    if not ext_id:
+        return internal_start
+
+    ext_path = _resolve_external_storage_path(ext_id)
+    _sub_box("Choose Storage", [
+        (1, "Internal", str(internal_start)),
+        (2, "External", str(ext_path)),
+    ], width=55, icon="◈")
+    try:
+        c = int(_ask(f"\n{V}  ❯{R} Pick: "))
+    except ValueError:
+        return internal_start
+
+    if c == 2:
+        if not ext_path.exists():
+            print(f"  {Y}[!]{R} Bound external path not found ({ext_path}). Falling back to Internal.")
+            return internal_start
+        return ext_path
+    return internal_start
 
 def _pick_folder_interactive(start):
     """Interactive folder browser.
@@ -5577,6 +5966,7 @@ def _get_session_destination():
         start = Path.home() / "storage" / "shared"
     else:
         start = Path.home()
+    start = _pick_storage_root(start)
 
     dest = _pick_folder_interactive(start)
     os.system("clear")
@@ -5593,6 +5983,48 @@ def _get_session_destination():
         _SESSION_DEST_FOLDER = None
         print(f"  {DIM}[i] Keeping downloads in the current folder.{R}")
         return None
+
+    if not os.access(dest, os.W_OK):
+        can_use_root = IS_TERMUX and _is_under_bound_external_storage(dest) and _has_root_access()
+        if can_use_root:
+            # Root will transparently handle the move, so there's nothing
+            # genuinely at risk here -- asking "use it anyway?" would just be
+            # friction for a question whose answer is already known.
+            print(f"  {DIM}[i] {LV}{dest}{R}{DIM} is read-only to this app, but root access")
+            print(f"  is available for your bound external storage — TagMan will use")
+            print(f"  it automatically if needed.{R}")
+        else:
+            while True:
+                print(f"  {Y}[!]{R} {LV}{dest}{R} looks read-only to this app — Android often")
+                print(f"  restricts write access on external/removable SD cards. The move")
+                print(f"  will likely fail after downloading.")
+                konfirm = input(
+                    f"  Use it anyway? (y = use it / n = pick another folder / q = keep current folder) [q]: "
+                ).strip().lower()
+                if konfirm == "y":
+                    break
+                if konfirm == "n":
+                    dest = _pick_folder_interactive(start)
+                    os.system("clear")
+                    if dest is None:
+                        _SESSION_DEST_FOLDER = None
+                        print(f"  {DIM}[i] Keeping downloads in the current folder.{R}")
+                        return None
+                    try:
+                        same_folder = dest.resolve() == Path.cwd().resolve()
+                    except Exception:
+                        same_folder = False
+                    if same_folder:
+                        _SESSION_DEST_FOLDER = None
+                        print(f"  {DIM}[i] Keeping downloads in the current folder.{R}")
+                        return None
+                    if os.access(dest, os.W_OK):
+                        break
+                    continue  # newly picked folder is ALSO read-only -- ask again
+                # "q", blank, or anything else -- keep current folder
+                _SESSION_DEST_FOLDER = None
+                print(f"  {DIM}[i] Keeping downloads in the current folder.{R}")
+                return None
 
     _SESSION_DEST_FOLDER = dest
     print(f"  {G}[+]{R} Saving downloaded file(s) to: {LV}{dest}{R}")
@@ -5622,6 +6054,8 @@ def _finalize_downloaded_files():
         return
 
     moved = 0
+    root_moved = 0
+    last_error = None
     for f in files:
         try:
             target = dest / f.name
@@ -5636,15 +6070,57 @@ def _finalize_downloaded_files():
                         target = candidate
                         break
                     n += 1
-            shutil.move(str(f), str(target))
-            moved += 1
-        except Exception:
-            pass
+            use_root = (IS_TERMUX and _is_under_bound_external_storage(target)
+                        and _has_root_access())
+            if use_root:
+                # Bound external storage on this device is known to reject
+                # plain writes -- skip the doomed shutil.move() attempt
+                # (it would just raise PermissionError every time) and go
+                # straight to the root move. Everywhere else -- other OSes,
+                # or internal storage on Termux -- this stays False and the
+                # normal move below runs exactly as before.
+                if _move_via_root(f, target):
+                    moved += 1
+                    root_moved += 1
+                else:
+                    last_error = PermissionError(
+                        f"root move failed for {f.name} -- destination stayed read-only"
+                    )
+                continue
+            try:
+                shutil.move(str(f), str(target))
+                moved += 1
+            except PermissionError as e:
+                # Fallback safety net for the case a path isn't recognized as
+                # bound external storage up front (or root wasn't available
+                # yet) but still turns out to be one -- same strict gate as
+                # above, just reached from the other direction.
+                if (IS_TERMUX and _is_under_bound_external_storage(target)
+                        and _has_root_access() and _move_via_root(f, target)):
+                    moved += 1
+                    root_moved += 1
+                else:
+                    raise
+        except Exception as e:
+            last_error = e
 
     if moved == len(files):
         print(f"  {G}[+]{R} Success — saved to {LV}{dest}{R}")
+        if root_moved:
+            print(f"  {DIM}({root_moved} file(s) moved via root — normal write access was denied){R}")
     else:
         print(f"  {Y}[!]{R} Unsuccessful — couldn't move all file(s) to {LV}{dest}{R}")
+        if last_error is not None:
+            print(f"  {DIM}Reason: {last_error}{R}")
+            if isinstance(last_error, PermissionError):
+                print(f"  {DIM}This usually means Android only gave read access to that")
+                print(f"  folder (common on external/removable SD cards). The file(s)")
+                if IS_TERMUX and _is_under_bound_external_storage(dest) and not _has_root_access():
+                    print(f"  stayed in the original download folder instead. If this")
+                    print(f"  device is rooted, granting Termux root access would let")
+                    print(f"  TagMan write there directly.{R}")
+                else:
+                    print(f"  stayed in the original download folder instead.{R}")
 
     if moved:
         try:
@@ -5662,6 +6138,7 @@ def _create_folder_shortcut():
     no raw symlinks, so it behaves identically on every filesystem
     (including Android's /sdcard, which can't hold symlinks at all)."""
     start = Path("/sdcard") if (IS_TERMUX and Path("/sdcard").exists()) else Path.home()
+    start = _pick_storage_root(start)
 
     print(f"\n  {LV}[i]{R} Browse to a folder, then press {P}s{R} to select it (q to cancel).")
     target_dir = _pick_folder_interactive(start)
@@ -5804,6 +6281,8 @@ def settings_menu():
         rename    = CONFIG.get("rename_mode", "ask")
         vid_mode  = CONFIG.get("video_search_mode", "ask")
         fold_mode = CONFIG.get("folder_reset_mode", "ignore")
+        ext_id    = CONFIG.get("external_storage_id")
+        ext_label = str(_resolve_external_storage_path(ext_id)) if ext_id else "Not bound"
 
         _sub_box("Settings", [
             (1, f"Remember Format: {fmt_label}",        "skip format prompt in Sorcerer"),
@@ -5816,6 +6295,7 @@ def settings_menu():
             (8, "Folder Shortcut",                        "browse (interactive) & drop a launcher shortcut into a folder"),
             (9, f"Folder Reset Mode: {fold_mode}",        "'always_ask' (return to $HOME after each task) or 'ignore' (stay put)"),
             (10, "History",                               "view edit/download history for this folder"),
+            (11, f"Bind External Storage: {ext_label}",   "remember an SD card/OTG/other drive for quick Internal/External picking"),
             (0, "Back",                                  None),
         ], width=60, icon="⚙")
 
@@ -5837,6 +6317,17 @@ def settings_menu():
             print(f"\n  {LV}[i]{R} Config stored at:")
             print(f"  {DIM}{CONFIG_PATH}{R}")
             print(f"  {DIM}Plain JSON file, can be opened/edited with any text editor.{R}")
+            # Also re-write it now with the current in-memory CONFIG. If the
+            # file on disk is stale, missing newer keys, or otherwise out of
+            # sync (the exact "had to delete + recreate it by hand" situation
+            # that used to be needed), this overwrites/repairs it in place
+            # instead of leaving the user to fix it manually.
+            if _save_config(CONFIG):
+                print(f"  {G}[+]{R} Re-saved current settings to that file (repairs it if it was stale).")
+            else:
+                print(f"  {Y}[!]{R} Tried to re-save it just now but that failed too.")
+                if _LAST_SAVE_ERROR:
+                    print(f"  {DIM}Reason: {_LAST_SAVE_ERROR}{R}")
         elif c == 6:
             _cleaner_menu()
         elif c == 7:
@@ -5847,6 +6338,8 @@ def settings_menu():
             _settings_folder_reset_mode()
         elif c == 10:
             _history_menu()
+        elif c == 11:
+            _settings_bind_external_storage()
         else:
             print(f"  {Y}[!]{R} Invalid choice.")
 

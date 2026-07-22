@@ -38,6 +38,31 @@ Then open a WSL/Ubuntu terminal and follow the Linux install steps below.
 Native Windows (cmd/PowerShell without WSL) may work partially, but expect
 rough edges.
 
+### A note on external storage (SD cards) on Android
+
+On Android, writing to a removable SD card is a **root-only** operation for
+apps like Termux — it's an OS-level restriction, not a TagMan bug or a
+`yt-dlp`/`mutagen` limitation. Internal shared storage
+(`/storage/emulated/0`, accessible after `termux-setup-storage`) is full
+read/write as normal; an SD card mounted at `/storage/<ID>` is **read-only**
+to Termux unless the device is rooted.
+
+If you `Settings -> Bind External Storage` to point at an SD card path:
+
+- **Rooted device:** TagMan detects root automatically (via `su`) and uses
+  it transparently for anything that needs to write there — downloads,
+  tag/lyrics/cover edits, all of it. You won't be prompted each time beyond
+  whatever your root manager (Magisk/KernelSU) is configured to ask.
+- **Not rooted:** writes to the SD card will fail with a permission error.
+  TagMan will tell you this plainly when it happens rather than failing
+  silently. Your options are to save to internal storage instead and move
+  the files over with a file manager app (which uses Android's Storage
+  Access Framework, not a plain filesystem write), or root the device.
+
+This is specific to **removable/external** storage on **Android**. Internal
+storage on Android, and every filesystem on Linux/macOS/Windows, isn't
+affected by any of this.
+
 ## Install
 
 ```bash

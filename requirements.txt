@@ -3,3 +3,8 @@ Pillow
 yt-dlp
 ytmusicapi
 syncedlyrics
+
+# Note: writing to a removable SD card on Android (Termux) requires root
+# (`su`) — this is an OS-level requirement, not a pip package, so there's
+# nothing to add here. See the README's "external storage on Android"
+# section for details.
